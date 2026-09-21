@@ -19,7 +19,7 @@ manual_content.py   texto do manual (editar aqui para atualizar)
 4. Copie .streamlit/secrets.toml.example (inclui SENHA_ACESSO, obrigatória) para Settings > Secrets do Streamlit Cloud e preencha com o JSON.
 5. Ajuste [sheet.tabs] se os nomes das abas forem diferentes.
 
-Sem secrets configurados, o app pede o .xlsx exportado da planilha (Arquivo > Fazer download > .xlsx).
+Alternativa sem conta de serviço: planilha auxiliar pública (ver abaixo). Sem nenhuma das duas, o app pede o .xlsx exportado da planilha (Arquivo > Fazer download > .xlsx).
 
 ## Deploy
 Repositório privado no GitHub, app no Streamlit Cloud com Main file = app.py. Após mudar módulos, Reboot (não Rerun).
@@ -27,3 +27,14 @@ Repositório privado no GitHub, app no Streamlit Cloud com Main file = app.py. A
 ## Rodar local
 pip install -r requirements.txt
 streamlit run app.py
+
+## Alternativa: planilha auxiliar com link público
+Crie uma planilha nova só com três abas (Registro, Prazos, Execução), cada uma com
+=IMPORTRANGE("ID_DA_PLANILHA_PRINCIPAL"; "Registro!A:Z") (ajuste nome da aba e intervalo) e autorize o acesso na primeira vez.
+Compartilhe a auxiliar como "Qualquer pessoa com o link: Leitor" e coloque só o ID dela nos Secrets:
+
+SENHA_ACESSO = "..."
+[sheet]
+id = "ID_DA_PLANILHA_AUXILIAR"
+
+Nunca coloque aqui o ID da planilha principal: o link público expõe todas as abas.

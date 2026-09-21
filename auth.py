@@ -92,7 +92,7 @@ def exigir_login() -> None:
 
 
 def botao_sair():
-    if st.sidebar.button("Sair", use_container_width=True):
+    if st.button("Sair", icon=":material/logout:", width="stretch"):
         for k in ("autenticado", "tentativas", "bloqueado_ate"):
             st.session_state.pop(k, None)
         st.rerun()

@@ -2,20 +2,19 @@ import pandas as pd
 import streamlit as st
 
 from auth import botao_sair, exigir_login
-from data import (load_from_gsheets, load_from_xlsx, prep_execucao, prep_prazos,
+from brand import URL_CALCULOS
+from data import (load_from_gsheets, load_from_public_link, load_from_xlsx, prep_execucao, prep_prazos,
                   prep_registro, quality_report)
 
 st.set_page_config(page_title="Núcleo Bancário | Dutra Bitencourt", page_icon="⚖️", layout="wide")
 
 st.markdown("""
 <style>
-header[data-testid="stHeader"] {background:transparent;}
-[data-testid="stSidebar"] {background:#00315F;}
-[data-testid="stSidebar"] * {color:#E8EEF6 !important;}
-[data-testid="stSidebar"] [data-baseweb="select"] * , [data-testid="stSidebar"] input {color:#1B2A3D !important;}
-[data-testid="stSidebar"] .stButton button {background:transparent; border:1px solid #7FA7D1;}
-[data-testid="stSidebar"] .stButton button:hover {border-color:#C9A227;}
-[data-testid="stSidebar"] [data-testid="stFileUploader"] section * {color:#1B2A3D !important;}
+header[data-testid="stHeader"] {background:#00315F; border-bottom:3px solid #C9A227;}
+header[data-testid="stHeader"] a, header[data-testid="stHeader"] span,
+header[data-testid="stHeader"] p, header[data-testid="stHeader"] button {color:#E8EEF6 !important;}
+[data-testid="stAppDeployButton"], [data-testid="stMainMenu"] {display:none;}
+.block-container {padding-top:4.5rem;}
 [data-testid="stMetricValue"] {font-variant-numeric: tabular-nums; color:#00315F;}
 blockquote {border-left:3px solid #2F7CC1; background:#F3F7FB; padding:.6rem 1rem; font-style:italic;}
 h1, h2, h3, h4 {color:#00315F;}
@@ -36,27 +35,63 @@ def _secret(chave):
 
 st.logo("assets/logo.png", size="large")
 
+from views import dash, manual  # noqa: E402
+
+PAINEL = [
+    st.Page(dash.visao_geral, title="Visão geral", icon=":material/insights:", default=True),
+    st.Page(dash.processos, title="Processos e sentenças", icon=":material/gavel:"),
+    st.Page(dash.prazos, title="Prazos", icon=":material/event_available:"),
+    st.Page(dash.execucao, title="Execução e alvarás", icon=":material/payments:"),
+    st.Page(dash.clientes, title="Clientes", icon=":material/groups:"),
+    st.Page(dash.ficha, title="Ficha do processo", icon=":material/description:"),
+    st.Page(dash.qualidade, title="Qualidade dos dados", icon=":material/rule:"),
+]
+MANUAL = [
+    st.Page(manual.script, title="Script de vendas", icon=":material/call:"),
+    st.Page(manual.procedimento, title="Procedimento interno", icon=":material/menu_book:"),
+]
+pagina = st.navigation({"Painel": PAINEL, "Manual": MANUAL}, position="top")
+no_painel = pagina.title in {p.title for p in PAINEL}
+
+
+# ------------------------------------------------------------------ barra de ações
+def _persistir(chave, padrao):
+    """Mantém o valor do filtro ao trocar de página."""
+    if chave in st.session_state:
+        st.session_state["_" + chave] = st.session_state[chave]
+    else:
+        st.session_state["_" + chave] = padrao
+
+
+barra = st.columns([6, 2, 2, 1.4, 1], vertical_alignment="center")
+with barra[2]:
+    st.link_button("Sistema de cálculos", URL_CALCULOS, icon=":material/calculate:", width="stretch")
+with barra[3]:
+    if st.button("Atualizar", icon=":material/refresh:", width="stretch"):
+        st.cache_data.clear()
+with barra[4]:
+    botao_sair()
+
+
 # ------------------------------------------------------------------ dados
 def _carrega():
     if _secret("gcp_service_account"):
         return load_from_gsheets()
-    st.sidebar.caption("Sem conexão configurada com o Google Sheets. Envie o .xlsx exportado da planilha.")
-    up = st.sidebar.file_uploader("Planilha (.xlsx)", type="xlsx")
-    if up is None:
+    sheet = _secret("sheet") or {}
+    if sheet.get("id"):
+        return load_from_public_link(sheet["id"])
+    if not no_painel:
         return None
-    return load_from_xlsx(up)
+    up = st.file_uploader("Sem planilha configurada nos Secrets. Envie o .xlsx exportado da planilha.",
+                          type="xlsx")
+    return load_from_xlsx(up) if up is not None else None
 
-
-with st.sidebar:
-    botao_sair()
-    if st.button("Atualizar dados"):
-        st.cache_data.clear()
 
 try:
     raw = _carrega()
 except Exception as e:  # noqa: BLE001
     raw = None
-    st.sidebar.error(f"Falha ao ler a planilha: {e}")
+    st.error(f"Falha ao ler a planilha: {e}")
 
 hoje = pd.Timestamp.today().normalize()
 if raw:
@@ -64,18 +99,36 @@ if raw:
     prz_all = prep_prazos(raw["prazos"])
     exe_all = prep_execucao(raw["execucao"])
 
-    with st.sidebar:
-        st.markdown("#### Filtros dos processos")
-        dmin, dmax = reg_all["Distribuição"].min(), reg_all["Distribuição"].max()
-        if pd.notna(dmin):
-            periodo = st.date_input("Distribuídos entre", (dmin.date(), dmax.date()),
-                                    min_value=dmin.date(), max_value=dmax.date(), format="DD/MM/YYYY")
-        else:
-            periodo = None
-        demandas = st.multiselect("Tipo de ação", sorted(reg_all["Demanda"].dropna().unique()))
-        bancos = st.multiselect("Banco", sorted(reg_all["Banco - Réu"].dropna().unique()))
-        tribunais = st.multiselect("Tribunal", sorted(reg_all["Tribunal"].dropna().unique()))
-        incluir_sem_dist = st.toggle("Incluir não distribuídos", value=True)
+    dmin, dmax = reg_all["Distribuição"].min(), reg_all["Distribuição"].max()
+    periodo_padrao = (dmin.date(), dmax.date()) if pd.notna(dmin) else None
+    for k, v in (("f_per", periodo_padrao), ("f_dem", []), ("f_ban", []), ("f_tri", []), ("f_sem", True)):
+        st.session_state.setdefault(k, v)
+
+    if no_painel:
+        with barra[1]:
+            ativos = sum(bool(st.session_state[k]) for k in ("f_dem", "f_ban", "f_tri"))
+            with st.popover(f"Filtros{f' ({ativos})' if ativos else ''}", icon=":material/filter_list:",
+                            width="stretch"):
+                if periodo_padrao:
+                    _persistir("f_per", periodo_padrao)
+                    st.date_input("Distribuídos entre", key="_f_per", min_value=dmin.date(),
+                                  max_value=dmax.date(), format="DD/MM/YYYY")
+                    st.session_state.f_per = st.session_state._f_per
+                for k, rot, col in (("f_dem", "Tipo de ação", "Demanda"), ("f_ban", "Banco", "Banco - Réu"),
+                                    ("f_tri", "Tribunal", "Tribunal")):
+                    _persistir(k, [])
+                    st.multiselect(rot, sorted(reg_all[col].dropna().unique()), key="_" + k)
+                    st.session_state[k] = st.session_state["_" + k]
+                _persistir("f_sem", True)
+                st.toggle("Incluir não distribuídos", key="_f_sem")
+                st.session_state.f_sem = st.session_state._f_sem
+                if st.button("Limpar filtros", width="stretch"):
+                    for k in ("f_per", "f_dem", "f_ban", "f_tri", "f_sem"):
+                        st.session_state.pop(k, None)
+                    st.rerun()
+
+    periodo, demandas = st.session_state.f_per, st.session_state.f_dem
+    bancos, tribunais, incluir_sem_dist = st.session_state.f_ban, st.session_state.f_tri, st.session_state.f_sem
 
     reg = reg_all.copy()
     if periodo and len(periodo) == 2:
@@ -94,29 +147,10 @@ if raw:
     st.session_state.update(
         reg=reg, reg_all=reg_all, prz=prz_all, exe=exe_all, hoje=hoje,
         avisos=quality_report(reg_all, prz_all, exe_all),
-        filtrado=bool(demandas or bancos or tribunais) or len(reg) != len(reg_all),
+        filtrado=len(reg) != len(reg_all),
     )
     st.session_state.pop("sem_dados", None)
 else:
     st.session_state.sem_dados = True
 
-
-# ------------------------------------------------------------------ navegação
-from views import dash, manual  # noqa: E402
-
-paginas = {
-    "Painel": [
-        st.Page(dash.visao_geral, title="Visão geral", icon=":material/insights:", default=True),
-        st.Page(dash.processos, title="Processos e sentenças", icon=":material/gavel:"),
-        st.Page(dash.prazos, title="Prazos", icon=":material/event_available:"),
-        st.Page(dash.execucao, title="Execução e alvarás", icon=":material/payments:"),
-        st.Page(dash.clientes, title="Clientes", icon=":material/groups:"),
-        st.Page(dash.ficha, title="Ficha do processo", icon=":material/description:"),
-        st.Page(dash.qualidade, title="Qualidade dos dados", icon=":material/rule:"),
-    ],
-    "Manual": [
-        st.Page(manual.script, title="Script de vendas", icon=":material/call:"),
-        st.Page(manual.procedimento, title="Procedimento interno", icon=":material/menu_book:"),
-    ],
-}
-st.navigation(paginas).run()
+pagina.run()

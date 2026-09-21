@@ -257,7 +257,7 @@ Duas etapas: qualificação pelo SDR antes do fechamento e revalidação pelo N�
 Etapa conduzida pelo Núcleo Bancário após o fechamento e a documentação completa.
 
 #### 4.1 Ferramenta de cálculo
-Apuração exclusivamente na ferramenta interna do escritório. :red[A credencial de acesso não fica neste manual; solicite à coordenação.]
+Apuração exclusivamente na ferramenta interna do escritório: [sistema de cálculos revisionais](https://dutrabitencourt-revisional.streamlit.app/). :red[A credencial de acesso não fica neste manual; solicite à coordenação.]
 
 Usos: pré-ajuizamento (valor pago a mais, saldo devedor recalculado, restituição estimada por contrato) e pós-sentença (valor devido na execução, revalidação e contraposição a cálculos do banco ou do perito).
 
