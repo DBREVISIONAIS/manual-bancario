@@ -250,6 +250,8 @@ def prep_registro(values, hoje: pd.Timestamp) -> pd.DataFrame:
     for c in VALORES:
         df[c] = parse_money(df[c])
     df["Contratuais (total)"] = df[["Contratuais", "Honorários Parc."]].sum(axis=1, min_count=1)
+    # percentual contratado em cada ação, lido do próprio Registro (Contratuais / Valor da causa)
+    df["% contratual"] = (df["Contratuais"] / df["Valor da causa"]).where(df["Valor da causa"] > 0)
     df["Honorários previstos"] = df[["Contratuais (total)", "Sucumbenciais"]].sum(axis=1, min_count=1)
     df.attrs["tem_parc"] = tem_parc
     df.attrs["totais"] = {c: _money_one(totais.get(c)) for c in VALORES + ["Contratos"]}
@@ -387,29 +389,32 @@ def prep_execucao(values) -> pd.DataFrame:
     return df
 
 
-def financeiro_execucao(exe: pd.DataFrame, pct: float, fixo_padrao: float,
-                        reg_all: pd.DataFrame | None = None) -> pd.DataFrame:
-    """Receita do escritório e repasse ao cliente em cada cumprimento.
+def financeiro_execucao(exe: pd.DataFrame, reg_all: pd.DataFrame | None) -> pd.DataFrame:
+    """Receita do escritório e repasse ao cliente em cada cumprimento, com os termos do Registro.
 
-    Contratuais = pct sobre o êxito do cliente + parcela fixa, descontados do alvará.
-    A parcela fixa vem da coluna "Honorários Parc." do processo originário no Registro
-    (célula vazia = R$ 0). Sem a coluna na planilha, ou sem vínculo pelo número CNJ,
-    usa o valor padrão das premissas.
-    Êxito do cliente = repetição + multa de 10%.
-    Sucumbência = honorários fixados + honorários de 10% do cumprimento.
+    Cada cumprimento é ligado ao processo originário pelo número CNJ. De lá vêm:
+      % contratual = Contratuais / Valor da causa daquela ação;
+      parcela fixa = Honorários Parc. daquela ação (célula vazia = R$ 0).
+    Contratuais na execução = % contratual × êxito do cliente + parcela fixa, limitado ao êxito.
+    Êxito do cliente = REPETIÇÃO + MULTA 10%. Sucumbência = HONORARIOS + HON. 10%.
+    Sem vínculo com o Registro, os contratuais ficam em branco: nada é presumido.
     """
     df = exe.copy()
-    df["Origem da parcela fixa"] = "Padrão das premissas"
-    df["Parcela fixa"] = float(fixo_padrao)
-    if reg_all is not None and reg_all.attrs.get("tem_parc"):
-        mapa = reg_all.dropna(subset=["cnj"]).drop_duplicates("cnj").set_index("cnj")["Honorários Parc."]
-        vinculado = df["cnj_orig"].isin(mapa.index)
-        df.loc[vinculado, "Parcela fixa"] = df.loc[vinculado, "cnj_orig"].map(mapa).fillna(0).astype(float)
-        df.loc[vinculado, "Origem da parcela fixa"] = "Registro"
+    df["% contratual"] = pd.NA
+    df["Parcela fixa"] = pd.NA
+    df["Vínculo com o Registro"] = False
+    if reg_all is not None and len(reg_all):
+        base = reg_all.dropna(subset=["cnj"]).drop_duplicates("cnj").set_index("cnj")
+        ok = df["cnj_orig"].isin(base.index)
+        df.loc[ok, "% contratual"] = df.loc[ok, "cnj_orig"].map(base["% contratual"])
+        df.loc[ok, "Parcela fixa"] = df.loc[ok, "cnj_orig"].map(base["Honorários Parc."]).fillna(0)
+        df["Vínculo com o Registro"] = ok
+    df["% contratual"] = pd.to_numeric(df["% contratual"], errors="coerce")
+    df["Parcela fixa"] = pd.to_numeric(df["Parcela fixa"], errors="coerce")
     exito = df["Êxito do cliente"]
-    bruto = (exito * pct + df["Parcela fixa"]).where(exito > 0)
+    bruto = (exito * df["% contratual"] + df["Parcela fixa"]).where(exito > 0)
     # o desconto sai da parte do cliente no alvará: não pode passar do êxito dele
-    df["Contratuais limitados ao êxito"] = bruto > exito
+    df["Contratuais limitados ao êxito"] = (bruto > exito).fillna(False)
     df["Contratuais (execução)"] = bruto.where(~df["Contratuais limitados ao êxito"], exito)
     df["Receita do escritório"] = df[["Sucumbência (execução)", "Contratuais (execução)"]].sum(axis=1, min_count=1)
     df["Repasse ao cliente"] = exito - df["Contratuais (execução)"].fillna(0)
@@ -476,8 +481,8 @@ def quality_report(reg, prz, exe) -> list[str]:
             avisos.append(f"Registro: {vazio.sum()} processos distribuídos sem valor em 'Honorários Parc.'. "
                           "O painel conta R$ 0 de parcela fixa neles; se for isso mesmo, preencha 0.")
     else:
-        avisos.append("Registro: a coluna 'Honorários Parc.' ainda não existe na planilha. A parcela fixa dos "
-                      "contratuais na execução usa o valor padrão das premissas da tela Financeiro.")
+        avisos.append("Registro: a coluna 'Honorários Parc.' ainda não existe na planilha. Sem ela, o painel "
+                      "considera parcela fixa R$ 0 e os contratuais ficam só com o percentual.")
     sem_cnj = reg["cnj"].isna() & reg["Nº processo"].notna() & (reg["Rito (grupo)"] != "Administrativo")
     if sem_cnj.any():
         avisos.append(f"Registro: {sem_cnj.sum()} nº de processo fora do padrão CNJ.")

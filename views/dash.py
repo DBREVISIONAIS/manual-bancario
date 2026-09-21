@@ -99,36 +99,11 @@ _CFG_RES = {
 COR_FASE = {"Não distribuído": "#D9E1EA", "Aguardando sentença": "#7FA7D1", "Sentença favorável": "#2F7CC1",
             "Em execução": "#C9A227", "Alvará expedido": "#3E8E7E", "Improcedente / extinto": "#B55A4A"}
 MOEDA = lambda rot=None: st.column_config.NumberColumn(rot, format="R$ %.2f")  # noqa: E731
-
-
-def _premissas():
-    s = st.session_state
-    s.setdefault("pct_contr", 30.0)
-    s.setdefault("fixo_contr", 500.0)
-    return s.pct_contr / 100, s.fixo_contr
-
-
-def _editar_premissas():
-    s = st.session_state
-    _premissas()
-    for k in ("pct_contr", "fixo_contr"):
-        if "_" + k not in s:
-            s["_" + k] = s[k]
-    with st.expander("Premissas do cálculo de honorários na execução"):
-        c1, c2 = st.columns(2)
-        c1.number_input("Contratuais (% sobre o êxito do cliente)", 0.0, 100.0, step=1.0, key="_pct_contr",
-                        on_change=lambda: s.update(pct_contr=s._pct_contr))
-        c2.number_input("Parcela fixa padrão (R$)", 0.0, step=100.0, key="_fixo_contr",
-                        on_change=lambda: s.update(fixo_contr=s._fixo_contr))
-        st.caption("Contratuais na execução = percentual sobre o êxito do cliente + parcela fixa. A parcela fixa vem "
-                   "da coluna Honorários Parc. do processo no Registro; o padrão acima só é usado quando a coluna "
-                   "não existe ou o cumprimento não está vinculado a um processo do Registro. "
-                   "Êxito do cliente = REPETIÇÃO + MULTA 10%. Sucumbência = HONORARIOS + HON. 10%.")
+PCT = st.column_config.NumberColumn("% contratual", format="percent")
 
 
 def _base_fin(reg, exe):
-    pct, fixo = _premissas()
-    ex = financeiro_execucao(exe, pct, fixo, st.session_state.get("reg_all"))
+    ex = financeiro_execucao(exe, st.session_state.get("reg_all"))
     r = reg.assign(**{"Fase financeira": fase_financeira(reg, exe)})
     return r, ex
 
@@ -187,7 +162,9 @@ def visao_geral():
 def financeiro():
     reg, _, exe_all = _dados()
     st.title("Financeiro")
-    _editar_premissas()
+    st.caption("Tudo parte da aba Registro: cada ação tem o seu percentual (Contratuais ÷ Valor da causa) e a sua "
+               "parcela fixa (Honorários Parc.). A execução usa esses mesmos termos, ação por ação, ligando o "
+               "cumprimento ao processo originário pelo número CNJ.")
     r, ex_all = _base_fin(reg, exe_all)
     # execuções só dos processos que passaram pelos filtros (as sem vínculo com o Registro entram sem filtro)
     if st.session_state.get("filtrado"):
@@ -207,6 +184,13 @@ def financeiro():
     c[1].metric("Contratuais (parcela fixa)", brl(r["Honorários Parc."].sum(), 0),
                 f"{num((r['Honorários Parc.'] > 0).sum())} ações com parcela", delta_color="off")
     c[2].metric("Sucumbência prevista", brl(r["Sucumbenciais"].sum(), 0))
+
+    pct = r["% contratual"].dropna()
+    if len(pct):
+        dist = (pct * 100).round(0).astype(int).value_counts().sort_index()
+        st.caption("Percentual contratual encontrado no Registro: " + "  |  ".join(
+            f"{k}%: {v} ações" for k, v in dist.items()) + ". Parcela fixa em "
+            f"{num((r['Honorários Parc.'] > 0).sum())} de {num(len(r))} ações.")
 
     fase = (r.groupby("Fase financeira").agg(
         Processos=("Cliente", "size"), Valor_causa=("Valor da causa", "sum"),
@@ -293,28 +277,51 @@ def financeiro():
 
     lim = ex[ex["Contratuais limitados ao êxito"]]
     if len(lim):
-        st.warning(f"Em {len(lim)} cumprimento(s) o êxito do cliente é pequeno e {num(100 * _premissas()[0])}% + "
+        st.warning(f"Em {len(lim)} cumprimento(s) o êxito do cliente é pequeno e o percentual + "
                    "a parcela fixa passaria do valor dele. O cálculo limitou os contratuais ao êxito, "
                    "com repasse zero: " + ", ".join(lim["CLIENTE"].astype(str)) + ". Confira como o contrato trata "
                    "esses casos.")
-    vis = ["CLIENTE", "CUMPRIMENTO", "Etapa atual", "TOTAL", "Êxito do cliente", "Parcela fixa",
-           "Sucumbência (execução)", "Contratuais (execução)", "Receita do escritório", "Repasse ao cliente", "ALVARA",
-           "Origem da parcela fixa"]
+    sem = ex[~ex["Vínculo com o Registro"]]
+    if len(sem):
+        st.warning(f"{len(sem)} cumprimento(s) sem processo correspondente no Registro (o número em ORIGINARIO não "
+                   "foi encontrado). Os contratuais deles ficam em branco até o vínculo ser corrigido: "
+                   + ", ".join(sem["CLIENTE"].astype(str)))
+    vis = ["CLIENTE", "CUMPRIMENTO", "Etapa atual", "TOTAL", "Êxito do cliente", "% contratual", "Parcela fixa",
+           "Contratuais (execução)", "Sucumbência (execução)", "Receita do escritório", "Repasse ao cliente", "ALVARA"]
     st.dataframe(ex[vis].sort_values("Receita do escritório", ascending=False), hide_index=True, width="stretch",
-                 column_config={c: MOEDA() for c in vis[3:-1]})
+                 column_config={**{c: MOEDA() for c in vis[3:]}, "% contratual": PCT})
 
-    st.subheader("Previsto × execução")
-    st.caption("Para os processos já em cumprimento: honorários previstos no Registro comparados com a "
-               "receita calculada na execução.")
-    cmp_ = r[["cnj", "Cliente", "Honorários previstos"]].merge(
-        ex[["cnj_orig", "Receita do escritório", "Etapa atual"]], left_on="cnj", right_on="cnj_orig")
+    st.subheader("Registro × execução, ação por ação")
+    st.caption("Para cada ação já em cumprimento: o que o Registro projetava e o que a execução efetivamente "
+               "calculou, com os mesmos termos contratuais. A realização mostra quanto do previsto virou crédito.")
+    reg_all = st.session_state.get("reg_all", r)
+    cols_r = ["cnj", "Cliente", "Banco - Réu", "Valor da causa", "% contratual", "Contratuais", "Honorários Parc.",
+              "Sucumbenciais", "Honorários previstos"]
+    cmp_ = reg_all[cols_r].merge(
+        ex[["cnj_orig", "Etapa atual", "TOTAL", "Êxito do cliente", "Contratuais (execução)",
+            "Sucumbência (execução)", "Receita do escritório"]], left_on="cnj", right_on="cnj_orig")
     if cmp_.empty:
         st.info("Nenhum processo do Registro com cumprimento vinculado pelo número CNJ.")
-    else:
-        cmp_["Diferença"] = cmp_["Receita do escritório"] - cmp_["Honorários previstos"]
-        st.dataframe(cmp_.drop(columns=["cnj", "cnj_orig"]), hide_index=True, width="stretch",
-                     column_config={c: MOEDA() for c in ["Honorários previstos", "Receita do escritório", "Diferença"]})
-
+        return
+    cmp_["Diferença"] = cmp_["Receita do escritório"] - cmp_["Honorários previstos"]
+    cmp_["Realização"] = cmp_["Receita do escritório"] / cmp_["Honorários previstos"].where(cmp_["Honorários previstos"] > 0)
+    calc = cmp_[cmp_["Receita do escritório"].notna()]
+    c = st.columns(4)
+    c[0].metric("Previsto no Registro", brl(calc["Honorários previstos"].sum()),
+                f"{len(calc)} ações com valores na execução", delta_color="off")
+    c[1].metric("Calculado na execução", brl(calc["Receita do escritório"].sum()))
+    c[2].metric("Diferença", brl(calc["Diferença"].sum()))
+    tot_prev = calc["Honorários previstos"].sum()
+    c[3].metric("Realização", f"{num(100 * calc['Receita do escritório'].sum() / tot_prev, 1)}%" if tot_prev else "–")
+    pend = len(cmp_) - len(calc)
+    if pend:
+        st.caption(f"Outras {pend} ações já estão na aba Execução, mas ainda sem valores; ficam fora da comparação.")
+    st.dataframe(cmp_.drop(columns=["cnj", "cnj_orig"]), hide_index=True, width="stretch", column_config={
+        **{k: MOEDA() for k in ["Valor da causa", "Contratuais", "Honorários Parc.", "Sucumbenciais",
+                                "Honorários previstos", "TOTAL", "Êxito do cliente", "Contratuais (execução)",
+                                "Sucumbência (execução)", "Receita do escritório", "Diferença"]},
+        "Contratuais": MOEDA("Contratuais (%) previstos"), "Honorários Parc.": MOEDA("Parcela fixa"),
+        "% contratual": PCT, "Realização": st.column_config.NumberColumn(format="percent")})
 
 def processos():
     reg, prz, _ = _dados()
