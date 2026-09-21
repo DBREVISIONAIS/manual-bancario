@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from datetime import date
+from datetime import date, datetime
 
 import pandas as pd
 import streamlit as st
@@ -88,8 +88,12 @@ def build_frame(values: list[list[str]], must_have: tuple[str, ...]) -> pd.DataF
             header = [c.strip() or f"col_{j}" for j, c in enumerate(row)]
             body = [r + [""] * (len(header) - len(r)) for r in values[i + 1:]]
             df = pd.DataFrame([r[: len(header)] for r in body], columns=header)
-            df = df.replace({"": pd.NA})
-            return df.dropna(how="all")
+            df = df.replace({"": pd.NA}).dropna(how="all")
+            acima = [r for r in values[:i] if any(str(c).strip() for c in r)]
+            if acima:  # linha de totais da planilha, usada para conferência
+                ult = acima[-1] + [""] * (len(header) - len(acima[-1]))
+                df.attrs["totais"] = dict(zip(header, ult[: len(header)]))
+            return df
     raise ValueError(f"Cabeçalho não encontrado (procurei {must_have}).")
 
 
@@ -132,6 +136,27 @@ def load_from_gsheets() -> dict[str, list[list[str]]]:
             raise ValueError(f"Aba '{names.get(key, default)}' não encontrada. Abas: {titles}")
         out[key] = sh.worksheet(title).get_all_values()
     return out
+
+
+def _celula_xlsx(v) -> str:
+    """Converte a célula do .xlsx para o mesmo texto que a planilha exibe.
+
+    Números viram texto com vírgula decimal ('185,829'), para não serem
+    confundidos com separador de milhar ('185.829' seria lido como 185 mil).
+    """
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ""
+    if isinstance(v, (pd.Timestamp, datetime)):
+        return v.strftime("%d/%m/%Y")
+    if isinstance(v, bool):
+        return str(v)
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        if v.is_integer():
+            return str(int(v))
+        return repr(v).replace(".", ",")
+    return str(v).strip()
 
 
 NOMES_PADRAO = (("registro", "Registro"), ("prazos", "Prazos"), ("execucao", "Execução"))
@@ -181,12 +206,8 @@ def load_from_xlsx(file) -> dict[str, list[list[str]]]:
         title = _match_ws(xl.sheet_names, default)
         if title is None:
             raise ValueError(f"Aba '{default}' não encontrada. Abas na planilha: {xl.sheet_names}")
-        df = xl.parse(title, header=None, dtype=str).fillna("")
-        # datas do Excel vêm como 'AAAA-MM-DD 00:00:00'; converte para dd/mm/aaaa
-        df = df.map(lambda v: re.sub(r"^(\d{4})-(\d{2})-(\d{2})( 00:00:00)?$", r"\3/\2/\1", v))
-        # inteiros do Excel vêm como '3.0'; volta para '3'
-        df = df.map(lambda v: v[:-2] if re.fullmatch(r"-?\d+\.0", v) else v)
-        out[key] = df.values.tolist()
+        df = xl.parse(title, header=None, dtype=object)
+        out[key] = df.map(_celula_xlsx).values.tolist()
     return out
 
 
@@ -194,9 +215,12 @@ def load_from_xlsx(file) -> dict[str, list[list[str]]]:
 
 def prep_registro(values, hoje: pd.Timestamp) -> pd.DataFrame:
     df = build_frame(values, TABS["registro"])
+    totais = df.attrs.get("totais", {})
     df = df[df["Cliente"].notna()].copy()
     for c in ["Valor da causa", "Causa s/ danos", "Contratuais", "Sucumbenciais"]:
         df[c] = parse_money(df[c])
+    df.attrs["totais"] = {c: _money_one(totais.get(c)) for c in
+                          ["Valor da causa", "Causa s/ danos", "Contratuais", "Sucumbenciais", "Contratos"]}
     for c in ["Assinatura", "Distribuição", "Data Sent.", "Trâns. Julgado"]:
         df[c] = parse_date(df[c])
     for c in ["Contratos", "Prazos"]:
@@ -324,6 +348,18 @@ def prep_execucao(values) -> pd.DataFrame:
 def quality_report(reg, prz, exe) -> list[str]:
     """Inconsistências que distorcem os indicadores."""
     avisos = []
+    totais = dict(reg.attrs.get("totais", {}))
+    # a linha de cima só serve de conferência se for o total geral: com filtro ativo na planilha
+    # ela vira SUBTOTAL parcial. O total de Contratos (inteiros, sem ambiguidade) indica qual é o caso.
+    tot_contr = totais.pop("Contratos", None)
+    total_geral = tot_contr is not None and abs(reg["Contratos"].sum() - tot_contr) < 0.5
+    for col, esperado in (totais.items() if total_geral else []):
+        if esperado:
+            lido = reg[col].sum()
+            if abs(lido - esperado) > max(1.0, 0.005 * abs(esperado)):
+                fmt = lambda v: f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+                avisos.append(f"Registro: a soma de '{col}' lida pelo painel ({fmt(lido)}) não bate com o total "
+                              f"da linha de cima da planilha ({fmt(esperado)}). Confira antes de usar esse número.")
     sem_cnj = reg["cnj"].isna() & reg["Nº processo"].notna() & (reg["Rito (grupo)"] != "Administrativo")
     if sem_cnj.any():
         avisos.append(f"Registro: {sem_cnj.sum()} nº de processo fora do padrão CNJ.")
