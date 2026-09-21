@@ -55,12 +55,32 @@ no_painel = pagina.title in {p.title for p in PAINEL}
 
 
 # ------------------------------------------------------------------ barra de ações
-def _persistir(chave, padrao):
-    """Mantém o valor do filtro ao trocar de página."""
-    if chave in st.session_state:
-        st.session_state["_" + chave] = st.session_state[chave]
-    else:
-        st.session_state["_" + chave] = padrao
+FILTROS = ("f_per", "f_rit", "f_dem", "f_ban", "f_tri", "f_sem")
+
+
+def _preparar(chave, opcoes=None):
+    """Recria o widget com o último valor salvo, só quando ele não existe.
+
+    O Streamlit apaga o estado do widget quando a página não o desenha (ex.: Manual).
+    O valor salvo em `chave` sobrevive e é devolvido ao widget `_chave`.
+    Nunca sobrescreve `_chave` se ele já existe: isso desfaria a seleção recém-feita.
+    """
+    w = "_" + chave
+    if w not in st.session_state:
+        valor = st.session_state[chave]
+        if opcoes is not None:
+            valor = [v for v in valor if v in opcoes]
+        st.session_state[w] = valor
+
+
+def _salvar(chave):
+    st.session_state[chave] = st.session_state["_" + chave]
+
+
+def _limpar():
+    for k in FILTROS:
+        st.session_state.pop(k, None)
+        st.session_state.pop("_" + k, None)
 
 
 barra = st.columns([6, 2, 2, 1.4, 1], vertical_alignment="center")
@@ -80,11 +100,17 @@ def _carrega():
     sheet = _secret("sheet") or {}
     if sheet.get("id"):
         return load_from_public_link(sheet["id"])
-    if not no_painel:
-        return None
-    up = st.file_uploader("Sem planilha configurada nos Secrets. Envie o .xlsx exportado da planilha.",
-                          type="xlsx")
-    return load_from_xlsx(up) if up is not None else None
+    # modo sem Secrets: o arquivo enviado fica guardado na sessão para sobreviver à troca de página
+    if no_painel and "xlsx_bytes" not in st.session_state:
+        up = st.file_uploader("Sem planilha configurada nos Secrets. Envie o .xlsx exportado da planilha.",
+                              type="xlsx")
+        if up is not None:
+            st.session_state.xlsx_bytes = up.getvalue()
+            st.rerun()
+    if "xlsx_bytes" in st.session_state:
+        import io
+        return load_from_xlsx(io.BytesIO(st.session_state.xlsx_bytes))
+    return None
 
 
 try:
@@ -110,22 +136,23 @@ if raw:
             with st.popover(f"Filtros{f' ({ativos})' if ativos else ''}", icon=":material/filter_list:",
                             width="stretch"):
                 if periodo_padrao:
-                    _persistir("f_per", periodo_padrao)
+                    p = st.session_state.f_per
+                    if not p or any(d < dmin.date() or d > dmax.date() for d in p):
+                        st.session_state.f_per = periodo_padrao  # dados mudaram: volta ao período cheio
+                        st.session_state.pop("_f_per", None)
+                    _preparar("f_per")
                     st.date_input("Distribuídos entre", key="_f_per", min_value=dmin.date(),
-                                  max_value=dmax.date(), format="DD/MM/YYYY")
-                    st.session_state.f_per = st.session_state._f_per
-                for k, rot, col in (("f_rit", "Rito", "Rito (grupo)"), ("f_dem", "Tipo de ação", "Demanda"), ("f_ban", "Banco", "Banco - Réu"),
-                                    ("f_tri", "Tribunal", "Tribunal")):
-                    _persistir(k, [])
-                    st.multiselect(rot, sorted(reg_all[col].dropna().unique()), key="_" + k)
-                    st.session_state[k] = st.session_state["_" + k]
-                _persistir("f_sem", True)
-                st.toggle("Incluir não distribuídos", key="_f_sem")
-                st.session_state.f_sem = st.session_state._f_sem
-                if st.button("Limpar filtros", width="stretch"):
-                    for k in ("f_per", "f_rit", "f_dem", "f_ban", "f_tri", "f_sem"):
-                        st.session_state.pop(k, None)
-                    st.rerun()
+                                  max_value=dmax.date(), format="DD/MM/YYYY",
+                                  on_change=_salvar, args=("f_per",))
+                for k, rot, col in (("f_rit", "Rito", "Rito (grupo)"), ("f_dem", "Tipo de ação", "Demanda"),
+                                    ("f_ban", "Banco", "Banco"), ("f_tri", "Tribunal", "Tribunal")):
+                    opcoes = sorted(reg_all[col].dropna().unique())
+                    _preparar(k, opcoes)
+                    st.multiselect(rot, opcoes, key="_" + k, placeholder="Todos",
+                                   on_change=_salvar, args=(k,))
+                _preparar("f_sem")
+                st.toggle("Incluir não distribuídos", key="_f_sem", on_change=_salvar, args=("f_sem",))
+                st.button("Limpar filtros", width="stretch", on_click=_limpar)
 
     periodo, demandas = st.session_state.f_per, st.session_state.f_dem
     bancos, tribunais, incluir_sem_dist = st.session_state.f_ban, st.session_state.f_tri, st.session_state.f_sem
@@ -143,7 +170,7 @@ if raw:
     if demandas:
         reg = reg[reg["Demanda"].isin(demandas)]
     if bancos:
-        reg = reg[reg["Banco - Réu"].isin(bancos)]
+        reg = reg[reg["Banco"].isin(bancos)]
     if tribunais:
         reg = reg[reg["Tribunal"].isin(tribunais)]
 

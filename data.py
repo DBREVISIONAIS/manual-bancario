@@ -73,6 +73,13 @@ def tribunal_from_cnj(d: pd.Series) -> pd.Series:
     return d.map(one)
 
 
+def banco_base(s: pd.Series) -> pd.Series:
+    """Remove a numeração do contrato: 'AGIBANK 9', 'AGIBANK9', 'AGIBANK (2)', 'AGIBANK - 3', 'AGIBANK nº 4' -> 'AGIBANK'."""
+    return (s.astype("string").str.strip().str.upper()
+            .str.replace(r"[\s\-–_#.]*(N[º°O]\.?\s*)?\(?\d+\)?$", "", regex=True)
+            .str.replace(r"\s+", " ", regex=True).str.strip())
+
+
 def cliente_base(s: pd.Series) -> pd.Series:
     """'FULANO x AGIBANK 2' -> 'FULANO'."""
     return (s.astype(str).str.split(r"\s+x\s+", n=1, regex=True).str[0]
@@ -229,6 +236,8 @@ def prep_registro(values, hoje: pd.Timestamp) -> pd.DataFrame:
     df["cnj"] = cnj_digits(df["Nº processo"])
     df["Tribunal"] = tribunal_from_cnj(df["cnj"])
     df["Cliente (base)"] = cliente_base(df["Cliente"])
+    # 'AGIBANK 9' identifica o 9º contrato; para análise, o banco é 'AGIBANK'
+    df["Banco"] = banco_base(df["Banco - Réu"])
     df["Situação"] = df["Situação"].astype("string").str.strip().str.capitalize()
     df["Rito (grupo)"] = df["Rito"].map(_classifica_rito)
     df["Sentença"] = df["Sentença"].astype("string").str.strip()

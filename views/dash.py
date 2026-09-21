@@ -131,8 +131,8 @@ def visao_geral():
 
     esq, dir_ = st.columns(2)
     with esq:
-        g = reg.groupby("Banco - Réu").size().nlargest(12).sort_values().reset_index(name="Processos")
-        _chart(px.bar(g, x="Processos", y="Banco - Réu", orientation="h", title="Bancos mais demandados"), 420)
+        g = reg.groupby("Banco").size().nlargest(12).sort_values().reset_index(name="Processos")
+        _chart(px.bar(g, x="Processos", y="Banco", orientation="h", title="Bancos mais demandados"), 420)
     with dir_:
         g = reg.groupby(["Tribunal", "Rito (grupo)"]).size().reset_index(name="Processos")
         fig = px.bar(g, x="Processos", y="Tribunal", color="Rito (grupo)", orientation="h",
@@ -212,7 +212,7 @@ def processos():
     resumo = pd.DataFrame({e: reg[e].describe()[["count", "mean", "50%", "min", "max"]] for e in etapas}).T
     resumo.columns = ["Processos", "Média", "Mediana", "Mínimo", "Máximo"]
     st.dataframe(resumo.style.format("{:.0f}"), width="stretch")
-    por = st.radio("Comparar por", ["Rito (grupo)", "Demanda", "Banco - Réu", "Tribunal"], horizontal=True,
+    por = st.radio("Comparar por", ["Rito (grupo)", "Demanda", "Banco", "Tribunal"], horizontal=True,
                    format_func=lambda c: "Rito" if c == "Rito (grupo)" else c)
     etapa = st.selectbox("Etapa", etapas, index=1)
     _chart(px.box(reg.dropna(subset=[etapa]), x=por, y=etapa, points="all",
@@ -227,7 +227,7 @@ def processos():
            80 + 30 * len(ped))
 
     st.subheader("Valor da causa")
-    por_v = st.radio("Agrupar valor por", ["Demanda", "Banco - Réu", "Tribunal"], horizontal=True, key="pv")
+    por_v = st.radio("Agrupar valor por", ["Demanda", "Banco", "Tribunal"], horizontal=True, key="pv")
     v = reg.groupby(por_v)["Valor da causa"].agg(["count", "mean", "median", "sum"]).reset_index()
     v.columns = [por_v, "Processos", "Média", "Mediana", "Soma"]
     st.dataframe(v.sort_values("Soma", ascending=False), hide_index=True, width="stretch",
@@ -341,7 +341,7 @@ def clientes():
     base = reg.assign(PrazosAba=reg["cnj"].map(n_prz).fillna(0))
     t = base.groupby("Cliente (base)").agg(
         Ações=("Cliente", "size"),
-        Bancos=("Banco - Réu", lambda s: ", ".join(sorted(s.dropna().unique()))),
+        Bancos=("Banco", lambda s: ", ".join(sorted(s.dropna().unique()))),
         Demandas=("Demanda", lambda s: ", ".join(sorted(s.dropna().unique()))),
         Valor_total=("Valor da causa", "sum"),
         Valor_médio=("Valor da causa", "mean"),
@@ -372,7 +372,7 @@ def clientes():
     if cli:
         r = reg[reg["Cliente (base)"] == cli]
         st.markdown(f"#### {cli}")
-        st.dataframe(r[["Demanda", "Rito (grupo)", "Banco - Réu", "Nº processo", "Tribunal", "Distribuição", "Valor da causa",
+        st.dataframe(r[["Demanda", "Rito (grupo)", "Banco", "Nº processo", "Tribunal", "Distribuição", "Valor da causa",
                         "Sentença", "Data Sent.", "Trâns. Julgado", "Dias em curso (calc.)"]],
                      hide_index=True, width="stretch",
                      column_config={"Valor da causa": st.column_config.NumberColumn(format="R$ %.2f"),
