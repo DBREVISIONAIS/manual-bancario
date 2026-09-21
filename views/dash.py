@@ -3,7 +3,7 @@ import plotly.express as px
 import plotly.io as pio
 import streamlit as st
 
-from data import EXEC_DATAS
+from data import EXEC_DATAS, FASES_FIN, fase_financeira, financeiro_execucao
 
 RITOS_JUD = ["Procedimento comum", "Juizado Especial (JEC)"]
 
@@ -24,6 +24,11 @@ def brl(v, casas=2):
         return "–"
     s = f"{v:,.{casas}f}".replace(",", "X").replace(".", ",").replace("X", ".")
     return f"R$ {s}"
+
+
+def brl_md(v, casas=2):
+    """brl() para texto em markdown (caption, warning): '$' sozinho vira fórmula LaTeX."""
+    return brl(v, casas).replace("$", r"\$")
 
 
 def num(v, casas=0):
@@ -89,6 +94,44 @@ _CFG_RES = {
 }
 
 
+
+# ------------------------------------------------------------------ financeiro (comum)
+COR_FASE = {"Não distribuído": "#D9E1EA", "Aguardando sentença": "#7FA7D1", "Sentença favorável": "#2F7CC1",
+            "Em execução": "#C9A227", "Alvará expedido": "#3E8E7E", "Improcedente / extinto": "#B55A4A"}
+MOEDA = lambda rot=None: st.column_config.NumberColumn(rot, format="R$ %.2f")  # noqa: E731
+
+
+def _premissas():
+    s = st.session_state
+    s.setdefault("pct_contr", 30.0)
+    s.setdefault("fixo_contr", 500.0)
+    return s.pct_contr / 100, s.fixo_contr
+
+
+def _editar_premissas():
+    s = st.session_state
+    _premissas()
+    for k in ("pct_contr", "fixo_contr"):
+        if "_" + k not in s:
+            s["_" + k] = s[k]
+    with st.expander("Premissas do cálculo de honorários na execução"):
+        c1, c2 = st.columns(2)
+        c1.number_input("Contratuais (% sobre o êxito do cliente)", 0.0, 100.0, step=1.0, key="_pct_contr",
+                        on_change=lambda: s.update(pct_contr=s._pct_contr))
+        c2.number_input("Parcela fixa padrão (R$)", 0.0, step=100.0, key="_fixo_contr",
+                        on_change=lambda: s.update(fixo_contr=s._fixo_contr))
+        st.caption("Contratuais na execução = percentual sobre o êxito do cliente + parcela fixa. A parcela fixa vem "
+                   "da coluna Honorários Parc. do processo no Registro; o padrão acima só é usado quando a coluna "
+                   "não existe ou o cumprimento não está vinculado a um processo do Registro. "
+                   "Êxito do cliente = REPETIÇÃO + MULTA 10%. Sucumbência = HONORARIOS + HON. 10%.")
+
+
+def _base_fin(reg, exe):
+    pct, fixo = _premissas()
+    ex = financeiro_execucao(exe, pct, fixo, st.session_state.get("reg_all"))
+    r = reg.assign(**{"Fase financeira": fase_financeira(reg, exe)})
+    return r, ex
+
 # ------------------------------------------------------------------ páginas
 def visao_geral():
     reg, prz, exe = _dados()
@@ -107,7 +150,7 @@ def visao_geral():
 
     c = st.columns(4)
     c[0].metric("Soma dos valores da causa", brl(reg["Valor da causa"].sum(), 0))
-    c[1].metric("Honorários contratuais estimados", brl(reg["Contratuais"].sum(), 0))
+    c[1].metric("Honorários contratuais estimados", brl(reg["Contratuais (total)"].sum(), 0))
     c[2].metric("Prazos cumpridos (total)", num(len(prz)))
     c[3].metric("Mediana distribuição → sentença", f"{num(reg['Distribuição → Sentença'].median())} dias")
 
@@ -139,6 +182,138 @@ def visao_geral():
                      title="Processos por tribunal e rito", labels={"Rito (grupo)": "Rito"})
         fig.update_yaxes(categoryorder="total ascending")
         _chart(fig, 420)
+
+
+def financeiro():
+    reg, _, exe_all = _dados()
+    st.title("Financeiro")
+    _editar_premissas()
+    r, ex_all = _base_fin(reg, exe_all)
+    # execuções só dos processos que passaram pelos filtros (as sem vínculo com o Registro entram sem filtro)
+    if st.session_state.get("filtrado"):
+        ex = ex_all[ex_all["cnj_orig"].isin(r["cnj"])]
+    else:
+        ex = ex_all
+
+    st.subheader("Carteira projetada")
+    st.caption("Valores da aba Registro. É a projeção se cada ação for julgada procedente como pedida: "
+               "valor da causa não é valor de condenação.")
+    c = st.columns(3)
+    c[0].metric("Valor da causa", brl(r["Valor da causa"].sum(), 0))
+    c[1].metric("Causa sem danos morais", brl(r["Causa s/ danos"].sum(), 0))
+    c[2].metric("Honorários previstos (total)", brl(r["Honorários previstos"].sum(), 0))
+    c = st.columns(3)
+    c[0].metric("Contratuais (percentual)", brl(r["Contratuais"].sum(), 0))
+    c[1].metric("Contratuais (parcela fixa)", brl(r["Honorários Parc."].sum(), 0),
+                f"{num((r['Honorários Parc.'] > 0).sum())} ações com parcela", delta_color="off")
+    c[2].metric("Sucumbência prevista", brl(r["Sucumbenciais"].sum(), 0))
+
+    fase = (r.groupby("Fase financeira").agg(
+        Processos=("Cliente", "size"), Valor_causa=("Valor da causa", "sum"),
+        Contratuais=("Contratuais (total)", "sum"), Sucumbência=("Sucumbenciais", "sum"),
+        Total=("Honorários previstos", "sum")).reindex(FASES_FIN).dropna(how="all").reset_index())
+    esq, dir_ = st.columns([3, 2])
+    with esq:
+        g = fase.melt(id_vars="Fase financeira", value_vars=["Contratuais", "Sucumbência"],
+                      var_name="Tipo", value_name="R$")
+        fig = px.bar(g, x="Fase financeira", y="R$", color="Tipo", title="Honorários previstos por fase",
+                     color_discrete_sequence=["#00315F", "#C9A227"], labels={"Fase financeira": ""})
+        _chart(fig, 380)
+    with dir_:
+        st.markdown("**Onde está o dinheiro previsto**")
+        st.dataframe(fase, hide_index=True, width="stretch", column_config={
+            "Valor_causa": MOEDA("Valor da causa"), "Contratuais": MOEDA(), "Sucumbência": MOEDA(),
+            "Total": MOEDA("Honorários previstos")})
+    risco = r.loc[r["Fase financeira"] == "Improcedente / extinto", "Honorários previstos"].sum()
+    favor = r.loc[r["Fase financeira"] == "Sentença favorável", "Honorários previstos"].sum()
+    st.caption(f"Já com sentença favorável e ainda sem execução: {brl_md(favor)}. "
+               f"Perdidos ou em risco (improcedentes e extintos, sujeitos a recurso): {brl_md(risco)}.")
+
+    esq, dir_ = st.columns(2)
+    with esq:
+        g = (r.groupby("Rito (grupo)")[["Contratuais (total)", "Sucumbenciais"]].sum()
+             .rename(columns={"Contratuais (total)": "Contratuais"}).reset_index())
+        _chart(px.bar(g.melt(id_vars="Rito (grupo)", var_name="Tipo", value_name="R$"), x="Rito (grupo)", y="R$",
+                      color="Tipo", barmode="group", title="Honorários previstos por rito",
+                      color_discrete_sequence=["#00315F", "#C9A227"], labels={"Rito (grupo)": ""}))
+        suc_jec = r.loc[r["Rito (grupo)"] == "Juizado Especial (JEC)", "Sucumbenciais"].sum()
+        if suc_jec > 0:
+            st.warning(f"Há {brl_md(suc_jec)} de sucumbência prevista em processos do JEC. Em 1º grau do "
+                       "Juizado não há condenação em honorários de sucumbência, salvo litigância de má-fé; "
+                       "confira essas linhas.")
+    with dir_:
+        g = (r.groupby("Banco")["Honorários previstos"].sum().nlargest(10).sort_values().reset_index())
+        _chart(px.bar(g, x="Honorários previstos", y="Banco", orientation="h",
+                      title="Honorários previstos por banco (10 maiores)"))
+
+    mes = r.dropna(subset=["Distribuição"]).assign(
+        Mês=lambda d: d["Distribuição"].dt.to_period("M").dt.to_timestamp())
+    g = (mes.groupby("Mês")[["Contratuais (total)", "Sucumbenciais"]].sum()
+         .rename(columns={"Contratuais (total)": "Contratuais"}).reset_index())
+    _chart(px.bar(g.melt(id_vars="Mês", var_name="Tipo", value_name="R$"), x="Mês", y="R$", color="Tipo",
+                  title="Honorários previstos pela data de distribuição",
+                  color_discrete_sequence=["#00315F", "#C9A227"]), 320)
+
+    st.subheader("Execuções: o que vamos receber")
+    if ex.empty:
+        st.info("Nenhum cumprimento de sentença no recorte atual.")
+        return
+    receber = ex[~ex["Alvará expedido"]]
+    recebido = ex[ex["Alvará expedido"]]
+    c = st.columns(4)
+    c[0].metric("Total executado", brl(ex["TOTAL"].sum()), f"{num(ex['TOTAL'].notna().sum())} cumprimentos com valor",
+                delta_color="off")
+    c[1].metric("Receita do escritório", brl(ex["Receita do escritório"].sum()),
+                f"sucumbência {brl(ex['Sucumbência (execução)'].sum())}", delta_color="off")
+    c[2].metric("Contratuais na execução", brl(ex["Contratuais (execução)"].sum()),
+                f"sobre êxito de {brl(ex['Êxito do cliente'].sum())}", delta_color="off")
+    c[3].metric("Repasse estimado aos clientes", brl(ex["Repasse ao cliente"].sum()))
+    c = st.columns(4)
+    c[0].metric("A receber (sem alvará)", brl(receber["Receita do escritório"].sum()))
+    c[1].metric("Já com alvará expedido", brl(recebido["Receita do escritório"].sum()),
+                f"alvarás: {brl(recebido['ALVARA'].sum())}", delta_color="off")
+    c[2].metric("Sucumbência a receber", brl(receber["Sucumbência (execução)"].sum()))
+    c[3].metric("Contratuais a receber", brl(receber["Contratuais (execução)"].sum()))
+
+    esq, dir_ = st.columns(2)
+    with esq:
+        g = ex.groupby("Etapa atual")[["Sucumbência (execução)", "Contratuais (execução)"]].sum()
+        g = g.reindex(["Não distribuído"] + EXEC_DATAS).dropna(how="all").reset_index()
+        _chart(px.bar(g.melt(id_vars="Etapa atual", var_name="Tipo", value_name="R$"), x="Etapa atual", y="R$",
+                      color="Tipo", title="Receita do escritório por etapa da execução",
+                      color_discrete_sequence=["#C9A227", "#00315F"], labels={"Etapa atual": ""}))
+    with dir_:
+        alv = ex.dropna(subset=["EXP. ALVARÁ"]).assign(
+            Mês=lambda d: d["EXP. ALVARÁ"].dt.to_period("M").dt.to_timestamp())
+        if alv.empty:
+            st.info("Ainda não há alvará expedido.")
+        else:
+            g = alv.groupby("Mês")["Receita do escritório"].sum().reset_index()
+            _chart(px.bar(g, x="Mês", y="Receita do escritório", title="Receita com alvará expedido, por mês"))
+
+    lim = ex[ex["Contratuais limitados ao êxito"]]
+    if len(lim):
+        st.warning(f"Em {len(lim)} cumprimento(s) o êxito do cliente é pequeno e {num(100 * _premissas()[0])}% + "
+                   "a parcela fixa passaria do valor dele. O cálculo limitou os contratuais ao êxito, "
+                   "com repasse zero: " + ", ".join(lim["CLIENTE"].astype(str)) + ". Confira como o contrato trata "
+                   "esses casos.")
+    vis = ["CLIENTE", "CUMPRIMENTO", "Etapa atual", "TOTAL", "Êxito do cliente", "Parcela fixa",
+           "Sucumbência (execução)", "Contratuais (execução)", "Receita do escritório", "Repasse ao cliente", "ALVARA",
+           "Origem da parcela fixa"]
+    st.dataframe(ex[vis].sort_values("Receita do escritório", ascending=False), hide_index=True, width="stretch",
+                 column_config={c: MOEDA() for c in vis[3:-1]})
+
+    st.subheader("Previsto × execução")
+    st.caption("Para os processos já em cumprimento: honorários previstos no Registro comparados com a "
+               "receita calculada na execução.")
+    cmp_ = r[["cnj", "Cliente", "Honorários previstos"]].merge(
+        ex[["cnj_orig", "Receita do escritório", "Etapa atual"]], left_on="cnj", right_on="cnj_orig")
+    if cmp_.empty:
+        st.info("Nenhum processo do Registro com cumprimento vinculado pelo número CNJ.")
+    else:
+        cmp_["Diferença"] = cmp_["Receita do escritório"] - cmp_["Honorários previstos"]
+        st.dataframe(cmp_.drop(columns=["cnj", "cnj_orig"]), hide_index=True, width="stretch",
+                     column_config={c: MOEDA() for c in ["Honorários previstos", "Receita do escritório", "Diferença"]})
 
 
 def processos():
@@ -337,57 +512,100 @@ def execucao():
 def clientes():
     reg, prz, exe = _dados()
     st.title("Clientes")
+    r, ex = _base_fin(reg, exe)
     n_prz = prz.groupby("cnj").size()
-    base = reg.assign(PrazosAba=reg["cnj"].map(n_prz).fillna(0))
-    t = base.groupby("Cliente (base)").agg(
+    r = r.assign(PrazosAba=r["cnj"].map(n_prz).fillna(0))
+    ex_cli = ex.groupby("Cliente (base)").agg(
+        Executado=("TOTAL", "sum"), Receita_exec=("Receita do escritório", "sum"),
+        Alvarás=("ALVARA", "sum"), Execuções=("CLIENTE", "size"))
+    t = r.groupby("Cliente (base)").agg(
         Ações=("Cliente", "size"),
         Bancos=("Banco", lambda s: ", ".join(sorted(s.dropna().unique()))),
         Demandas=("Demanda", lambda s: ", ".join(sorted(s.dropna().unique()))),
         Valor_total=("Valor da causa", "sum"),
-        Valor_médio=("Valor da causa", "mean"),
-        Contratuais=("Contratuais", "sum"),
+        Contratuais=("Contratuais (total)", "sum"),
+        Parcela=("Honorários Parc.", "sum"),
+        Sucumbência=("Sucumbenciais", "sum"),
+        Previstos=("Honorários previstos", "sum"),
         Sentenças=("Tem sentença", "sum"),
         Prazos=("PrazosAba", "sum"),
         Primeira_distribuição=("Distribuição", "min"),
-    ).reset_index().sort_values("Valor_total", ascending=False)
+    ).join(ex_cli, how="left").reset_index().sort_values("Previstos", ascending=False)
 
     c = st.columns(4)
     c[0].metric("Clientes", num(len(t)))
     c[1].metric("Ações por cliente (média)", num(t["Ações"].mean(), 2))
-    c[2].metric("Valor da causa por cliente (média)", brl(t["Valor_total"].mean()))
+    c[2].metric("Honorários previstos por cliente (média)", brl(t["Previstos"].mean()))
     c[3].metric("Clientes com mais de uma ação", num((t["Ações"] > 1).sum()))
 
-    _chart(px.histogram(t, x="Ações", title="Quantas ações cada cliente tem",
-                        labels={"Ações": "ações por cliente"}).update_layout(bargap=.15, yaxis_title="clientes"), 300)
+    esq, dir_ = st.columns(2)
+    with esq:
+        g = t["Ações"].value_counts().sort_index().reset_index()
+        g.columns = ["Ações", "Clientes"]
+        _chart(px.bar(g, x="Ações", y="Clientes", text="Clientes", title="Quantas ações cada cliente tem",
+                      labels={"Ações": "ações por cliente"}).update_xaxes(type="category"), 320)
+    with dir_:
+        g = t.nlargest(10, "Previstos").sort_values("Previstos")
+        g = g.melt(id_vars="Cliente (base)", value_vars=["Contratuais", "Sucumbência"], var_name="Tipo", value_name="R$")
+        _chart(px.bar(g, x="R$", y="Cliente (base)", color="Tipo", orientation="h",
+                      title="10 clientes com mais honorários previstos",
+                      color_discrete_sequence=["#00315F", "#C9A227"], labels={"Cliente (base)": ""}), 320)
 
     st.dataframe(t, hide_index=True, width="stretch", column_config={
-        "Valor_total": st.column_config.NumberColumn("Valor da causa (soma)", format="R$ %.2f"),
-        "Valor_médio": st.column_config.NumberColumn("Valor da causa (média)", format="R$ %.2f"),
-        "Contratuais": st.column_config.NumberColumn("Honorários contratuais", format="R$ %.2f"),
-        "Prazos": st.column_config.NumberColumn(format="%d"),
+        "Valor_total": MOEDA("Valor da causa"), "Contratuais": MOEDA("Contratuais previstos"),
+        "Parcela": MOEDA("dos quais parcela fixa"),
+        "Sucumbência": MOEDA("Sucumbência prevista"), "Previstos": MOEDA("Honorários previstos"),
+        "Executado": MOEDA("Em execução"), "Receita_exec": MOEDA("Receita na execução"),
+        "Alvarás": MOEDA("Alvarás"), "Prazos": st.column_config.NumberColumn(format="%d"),
+        "Execuções": st.column_config.NumberColumn(format="%d"),
         "Primeira_distribuição": st.column_config.DateColumn("1ª distribuição", format="DD/MM/YYYY"),
     })
 
     cli = st.selectbox("Abrir cliente", t["Cliente (base)"], index=None, placeholder="Escolha um cliente")
-    if cli:
-        r = reg[reg["Cliente (base)"] == cli]
-        st.markdown(f"#### {cli}")
-        st.dataframe(r[["Demanda", "Rito (grupo)", "Banco", "Nº processo", "Tribunal", "Distribuição", "Valor da causa",
-                        "Sentença", "Data Sent.", "Trâns. Julgado", "Dias em curso (calc.)"]],
+    if not cli:
+        return
+    rc = r[r["Cliente (base)"] == cli]
+    ec = ex[ex["Cliente (base)"] == cli]
+    st.markdown(f"### {cli}")
+
+    c = st.columns(4)
+    c[0].metric("Ações", num(len(rc)), f"{num(rc['Tem sentença'].sum())} com sentença", delta_color="off")
+    c[1].metric("Valor da causa", brl(rc["Valor da causa"].sum()),
+                f"sem danos: {brl(rc['Causa s/ danos'].sum())}", delta_color="off")
+    c[2].metric("Contratuais previstos", brl(rc["Contratuais (total)"].sum()),
+                f"parcela fixa: {brl(rc['Honorários Parc.'].sum())}", delta_color="off")
+    c[3].metric("Sucumbência prevista", brl(rc["Sucumbenciais"].sum()))
+    c = st.columns(4)
+    c[0].metric("Honorários previstos", brl(rc["Honorários previstos"].sum()))
+    c[1].metric("Em execução", brl(ec["TOTAL"].sum()), f"{num(len(ec))} cumprimentos", delta_color="off")
+    c[2].metric("Receita do escritório na execução", brl(ec["Receita do escritório"].sum()))
+    c[3].metric("Repasse estimado ao cliente", brl(ec["Repasse ao cliente"].sum()))
+
+    fases = rc["Fase financeira"].value_counts().reindex(FASES_FIN).dropna()
+    st.caption("Situação das ações: " + "  |  ".join(f"{f}: {int(n)}" for f, n in fases.items()))
+
+    st.markdown("**Ações**")
+    cols = ["Demanda", "Rito (grupo)", "Banco - Réu", "Benefício", "Nº processo", "Tribunal", "Fase financeira", "Distribuição",
+            "Valor da causa", "Contratuais", "Honorários Parc.", "Sucumbenciais", "Honorários previstos", "Sentença",
+            "Data Sent.",
+            "Trâns. Julgado"]
+    st.dataframe(rc[cols], hide_index=True, width="stretch", column_config={
+        "Rito (grupo)": "Rito", "Banco - Réu": "Banco",
+        "Contratuais": MOEDA("Contratuais (%)"), "Honorários Parc.": MOEDA("Parcela fixa"),
+        **{c: MOEDA() for c in ["Valor da causa", "Sucumbenciais", "Honorários previstos"]},
+        **{c: st.column_config.DateColumn(format="DD/MM/YYYY") for c in ["Distribuição", "Data Sent.", "Trâns. Julgado"]}})
+
+    if len(ec):
+        st.markdown("**Execuções**")
+        vis = ["CLIENTE", "CUMPRIMENTO", "Etapa atual", "TOTAL", "Êxito do cliente", "Parcela fixa",
+               "Sucumbência (execução)", "Contratuais (execução)", "Receita do escritório", "Repasse ao cliente", "ALVARA"]
+        st.dataframe(ec[vis], hide_index=True, width="stretch", column_config={c: MOEDA() for c in vis[3:]})
+
+    p = prz[prz["cnj"].isin(rc["cnj"]) | (prz["Cliente (base)"] == cli)]
+    with st.expander(f"Prazos ({len(p)})"):
+        st.dataframe(p[["PROCESSO", "DEMANDA", "CONCLUSÃO", "FATAL", "Antecedência (dias)"]].sort_values("CONCLUSÃO"),
                      hide_index=True, width="stretch",
-                     column_config={"Valor da causa": st.column_config.NumberColumn(format="R$ %.2f"),
-                                    **{c: st.column_config.DateColumn(format="DD/MM/YYYY")
-                                       for c in ["Distribuição", "Data Sent.", "Trâns. Julgado"]}})
-        p = prz[prz["cnj"].isin(r["cnj"]) | (prz["Cliente (base)"] == cli)]
-        st.markdown(f"**Prazos ({len(p)})**")
-        st.dataframe(p[["PROCESSO", "DEMANDA", "CONCLUSÃO", "FATAL", "Antecedência (dias)"]]
-                     .sort_values("CONCLUSÃO"), hide_index=True, width="stretch",
                      column_config={c: st.column_config.DateColumn(format="DD/MM/YYYY") for c in ["CONCLUSÃO", "FATAL"]})
-        e = exe[exe["Cliente (base)"] == cli]
-        if len(e):
-            st.markdown("**Execuções**")
-            st.dataframe(e[["CLIENTE", "CUMPRIMENTO", "Etapa atual", "TOTAL", "HONORARIOS"]], hide_index=True,
-                         width="stretch")
 
 
 def ficha():
@@ -404,10 +622,11 @@ def ficha():
 
     c = st.columns(4)
     c[0].metric("Valor da causa", brl(r["Valor da causa"]))
-    c[1].metric("Honorários contratuais", brl(r["Contratuais"]))
+    c[1].metric("Honorários contratuais", brl(r["Contratuais (total)"]),
+                f"parcela fixa: {brl(r['Honorários Parc.'])}", delta_color="off")
     c[2].metric("Tribunal", _txt(r["Tribunal"]))
     c[3].metric("Dias em curso", num(r["Dias em curso (calc.)"]))
-    st.markdown(f"**Status:** {_txt(r['Status'])}  |  **Rito:** {r['Rito (grupo)']}  |  "
+    st.markdown(f"**Status:** {_txt(r['Status'])}  |  **Rito:** {r['Rito (grupo)']}{'  |  **Benefício:** ' + r['Benefício'] if isinstance(r.get('Benefício'), str) else ''}  |  "
                 f"**Contratos:** {num(r['Contratos'])}  |  **Sentença:** {_txt(r['Sentença'], 'sem sentença')}  |  "
                 f"**Pedidos:** {_txt(r['Pedidos'])}")
     if isinstance(r.get("Bitrix processo"), str) and r["Bitrix processo"].startswith("http"):

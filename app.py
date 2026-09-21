@@ -39,6 +39,7 @@ from views import dash, manual  # noqa: E402
 
 PAINEL = [
     st.Page(dash.visao_geral, title="Visão geral", icon=":material/insights:", default=True),
+    st.Page(dash.financeiro, title="Financeiro", icon=":material/account_balance_wallet:"),
     st.Page(dash.processos, title="Processos e sentenças", icon=":material/gavel:"),
     st.Page(dash.prazos, title="Prazos", icon=":material/event_available:"),
     st.Page(dash.execucao, title="Execução e alvarás", icon=":material/payments:"),

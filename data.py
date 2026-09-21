@@ -73,11 +73,28 @@ def tribunal_from_cnj(d: pd.Series) -> pd.Series:
     return d.map(one)
 
 
+_BENEFICIO = r"PENS[AÃ]O|APOSENTADORIA|APOSENT\.?"
+
+
 def banco_base(s: pd.Series) -> pd.Series:
-    """Remove a numeração do contrato: 'AGIBANK 9', 'AGIBANK9', 'AGIBANK (2)', 'AGIBANK - 3', 'AGIBANK nº 4' -> 'AGIBANK'."""
-    return (s.astype("string").str.strip().str.upper()
-            .str.replace(r"[\s\-–_#.]*(N[º°O]\.?\s*)?\(?\d+\)?$", "", regex=True)
-            .str.replace(r"\s+", " ", regex=True).str.strip())
+    """Deixa só o nome do banco.
+
+    Remove o tipo de benefício e a modalidade RMC/RCC ('FACTA PENSÃO', 'PAN RCC APOSENTADORIA', 'PAN (APOSENTADORIA)', 'FACTA - PENSÃO 2')
+    e a numeração do contrato ('AGIBANK 9', 'AGIBANK9', 'AGIBANK (2)', 'AGIBANK - 3', 'AGIBANK nº 4').
+    """
+    t = s.astype("string").str.strip().str.upper()
+    t = t.str.replace(rf"[\s\-–_/(]*\b({_BENEFICIO})\b[\s)]*", " ", regex=True)
+    t = t.str.replace(r"[\s\-–_/(]*\b(RMC|RCC)\b[\s)]*", " ", regex=True)  # modalidade já está em Demanda
+    t = t.str.replace(r"[\s\-–_#.]*(N[º°O]\.?\s*)?\(?\d+\)?\s*$", "", regex=True)
+    return t.str.replace(r"\s+", " ", regex=True).str.strip(" -–_/")
+
+
+def beneficio(s: pd.Series) -> pd.Series:
+    """Pensão ou Aposentadoria, quando indicado junto do banco."""
+    t = s.astype("string").str.upper()
+    return pd.Series(pd.NA, index=s.index, dtype="string").mask(
+        t.str.contains(r"PENS[AÃ]O", regex=True, na=False), "Pensão").mask(
+        t.str.contains(r"APOSENT", regex=True, na=False), "Aposentadoria")
 
 
 def cliente_base(s: pd.Series) -> pd.Series:
@@ -224,10 +241,18 @@ def prep_registro(values, hoje: pd.Timestamp) -> pd.DataFrame:
     df = build_frame(values, TABS["registro"])
     totais = df.attrs.get("totais", {})
     df = df[df["Cliente"].notna()].copy()
-    for c in ["Valor da causa", "Causa s/ danos", "Contratuais", "Sucumbenciais"]:
+    # "Honorários Parc." = parcela fixa dos contratuais (ex.: R$ 500 em só uma das ações do contrato).
+    # Planilhas antigas não têm a coluna: ela é criada vazia e a execução usa o valor padrão das premissas.
+    tem_parc = "Honorários Parc." in df.columns
+    if not tem_parc:
+        df["Honorários Parc."] = pd.NA
+    VALORES = ["Valor da causa", "Causa s/ danos", "Contratuais", "Honorários Parc.", "Sucumbenciais"]
+    for c in VALORES:
         df[c] = parse_money(df[c])
-    df.attrs["totais"] = {c: _money_one(totais.get(c)) for c in
-                          ["Valor da causa", "Causa s/ danos", "Contratuais", "Sucumbenciais", "Contratos"]}
+    df["Contratuais (total)"] = df[["Contratuais", "Honorários Parc."]].sum(axis=1, min_count=1)
+    df["Honorários previstos"] = df[["Contratuais (total)", "Sucumbenciais"]].sum(axis=1, min_count=1)
+    df.attrs["tem_parc"] = tem_parc
+    df.attrs["totais"] = {c: _money_one(totais.get(c)) for c in VALORES + ["Contratos"]}
     for c in ["Assinatura", "Distribuição", "Data Sent.", "Trâns. Julgado"]:
         df[c] = parse_date(df[c])
     for c in ["Contratos", "Prazos"]:
@@ -238,6 +263,7 @@ def prep_registro(values, hoje: pd.Timestamp) -> pd.DataFrame:
     df["Cliente (base)"] = cliente_base(df["Cliente"])
     # 'AGIBANK 9' identifica o 9º contrato; para análise, o banco é 'AGIBANK'
     df["Banco"] = banco_base(df["Banco - Réu"])
+    df["Benefício"] = beneficio(df["Banco - Réu"])
     df["Situação"] = df["Situação"].astype("string").str.strip().str.capitalize()
     df["Rito (grupo)"] = df["Rito"].map(_classifica_rito)
     df["Sentença"] = df["Sentença"].astype("string").str.strip()
@@ -351,7 +377,67 @@ def prep_execucao(values) -> pd.DataFrame:
     df["Distrib. → Alvará expedido"] = (df["EXP. ALVARÁ"] - df["DISTRIB."]).dt.days
     df["Etapa atual"] = df[EXEC_DATAS].apply(
         lambda r: next((c for c in reversed(EXEC_DATAS) if pd.notna(r[c])), "Não distribuído"), axis=1)
+
+    # composição do crédito: TOTAL = HONORARIOS + REPETIÇÃO + MULTA 10% + HON. 10%
+    partes = df[["HONORARIOS", "REPETIÇÃO", "MULTA 10%", "HON. 10%"]]
+    df["Soma das parcelas"] = partes.sum(axis=1, min_count=1)
+    df["Êxito do cliente"] = df[["REPETIÇÃO", "MULTA 10%"]].sum(axis=1, min_count=1)
+    df["Sucumbência (execução)"] = df[["HONORARIOS", "HON. 10%"]].sum(axis=1, min_count=1)
+    df["Alvará expedido"] = df["EXP. ALVARÁ"].notna()
     return df
+
+
+def financeiro_execucao(exe: pd.DataFrame, pct: float, fixo_padrao: float,
+                        reg_all: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Receita do escritório e repasse ao cliente em cada cumprimento.
+
+    Contratuais = pct sobre o êxito do cliente + parcela fixa, descontados do alvará.
+    A parcela fixa vem da coluna "Honorários Parc." do processo originário no Registro
+    (célula vazia = R$ 0). Sem a coluna na planilha, ou sem vínculo pelo número CNJ,
+    usa o valor padrão das premissas.
+    Êxito do cliente = repetição + multa de 10%.
+    Sucumbência = honorários fixados + honorários de 10% do cumprimento.
+    """
+    df = exe.copy()
+    df["Origem da parcela fixa"] = "Padrão das premissas"
+    df["Parcela fixa"] = float(fixo_padrao)
+    if reg_all is not None and reg_all.attrs.get("tem_parc"):
+        mapa = reg_all.dropna(subset=["cnj"]).drop_duplicates("cnj").set_index("cnj")["Honorários Parc."]
+        vinculado = df["cnj_orig"].isin(mapa.index)
+        df.loc[vinculado, "Parcela fixa"] = df.loc[vinculado, "cnj_orig"].map(mapa).fillna(0).astype(float)
+        df.loc[vinculado, "Origem da parcela fixa"] = "Registro"
+    exito = df["Êxito do cliente"]
+    bruto = (exito * pct + df["Parcela fixa"]).where(exito > 0)
+    # o desconto sai da parte do cliente no alvará: não pode passar do êxito dele
+    df["Contratuais limitados ao êxito"] = bruto > exito
+    df["Contratuais (execução)"] = bruto.where(~df["Contratuais limitados ao êxito"], exito)
+    df["Receita do escritório"] = df[["Sucumbência (execução)", "Contratuais (execução)"]].sum(axis=1, min_count=1)
+    df["Repasse ao cliente"] = exito - df["Contratuais (execução)"].fillna(0)
+    return df
+
+
+FASES_FIN = ["Não distribuído", "Aguardando sentença", "Sentença favorável", "Em execução",
+             "Alvará expedido", "Improcedente / extinto"]
+
+
+def fase_financeira(reg: pd.DataFrame, exe: pd.DataFrame) -> pd.Series:
+    """Em que ponto do caminho até o dinheiro cada processo está."""
+    em_exec = set(exe.loc[exe["DISTRIB."].notna(), "cnj_orig"].dropna())
+    alvara = set(exe.loc[exe["EXP. ALVARÁ"].notna(), "cnj_orig"].dropna())
+
+    def uma(r):
+        if r["cnj"] in alvara:
+            return "Alvará expedido"
+        if r["cnj"] in em_exec:
+            return "Em execução"
+        if r["Resultado"] in ("Improcedente", "Extinção sem mérito"):
+            return "Improcedente / extinto"
+        if r["Resultado"] in ("Procedente", "Parcialmente procedente", "Acordo"):
+            return "Sentença favorável"
+        if pd.notna(r["Distribuição"]):
+            return "Aguardando sentença"
+        return "Não distribuído"
+    return reg.apply(uma, axis=1)
 
 
 def quality_report(reg, prz, exe) -> list[str]:
@@ -369,6 +455,29 @@ def quality_report(reg, prz, exe) -> list[str]:
                 fmt = lambda v: f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
                 avisos.append(f"Registro: a soma de '{col}' lida pelo painel ({fmt(lido)}) não bate com o total "
                               f"da linha de cima da planilha ({fmt(esperado)}). Confira antes de usar esse número.")
+    if "Soma das parcelas" in exe:
+        dif = exe[(exe["TOTAL"].notna()) & ((exe["TOTAL"] - exe["Soma das parcelas"]).abs() > 0.05)]
+        if len(dif):
+            avisos.append(f"Execução: em {len(dif)} cumprimento(s) o TOTAL não bate com HONORARIOS + REPETIÇÃO + "
+                          f"MULTA 10% + HON. 10% ({', '.join(dif['CLIENTE'].astype(str).head(4))}). "
+                          "Os valores de receita dessas linhas saem das parcelas, não do TOTAL.")
+    if reg.attrs.get("tem_parc"):
+        # contagem dobrada: Contratuais (H) ainda com a parcela fixa embutida depois de criada a coluna I
+        c = reg.dropna(subset=["Contratuais", "Valor da causa", "Honorários Parc."])
+        c = c[c["Honorários Parc."] > 0]
+        dobrado = c[(c["Contratuais"] - 0.30 * c["Valor da causa"] - c["Honorários Parc."]).abs() < 1]
+        if len(dobrado):
+            avisos.append(f"Registro: em {len(dobrado)} processos a coluna Contratuais parece já incluir a parcela "
+                          "fixa (30% da causa + Honorários Parc.). Com a coluna nova, Contratuais deve ter só o "
+                          "percentual; do contrário a parcela entra duas vezes: "
+                          + ", ".join(dobrado["Cliente"].astype(str).head(5)) + ("…" if len(dobrado) > 5 else ""))
+        vazio = reg["Honorários Parc."].isna() & reg["Distribuição"].notna()
+        if vazio.any():
+            avisos.append(f"Registro: {vazio.sum()} processos distribuídos sem valor em 'Honorários Parc.'. "
+                          "O painel conta R$ 0 de parcela fixa neles; se for isso mesmo, preencha 0.")
+    else:
+        avisos.append("Registro: a coluna 'Honorários Parc.' ainda não existe na planilha. A parcela fixa dos "
+                      "contratuais na execução usa o valor padrão das premissas da tela Financeiro.")
     sem_cnj = reg["cnj"].isna() & reg["Nº processo"].notna() & (reg["Rito (grupo)"] != "Administrativo")
     if sem_cnj.any():
         avisos.append(f"Registro: {sem_cnj.sum()} nº de processo fora do padrão CNJ.")
