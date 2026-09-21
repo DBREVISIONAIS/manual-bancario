@@ -101,12 +101,12 @@ if raw:
 
     dmin, dmax = reg_all["Distribuição"].min(), reg_all["Distribuição"].max()
     periodo_padrao = (dmin.date(), dmax.date()) if pd.notna(dmin) else None
-    for k, v in (("f_per", periodo_padrao), ("f_dem", []), ("f_ban", []), ("f_tri", []), ("f_sem", True)):
+    for k, v in (("f_per", periodo_padrao), ("f_dem", []), ("f_ban", []), ("f_tri", []), ("f_rit", []), ("f_sem", True)):
         st.session_state.setdefault(k, v)
 
     if no_painel:
         with barra[1]:
-            ativos = sum(bool(st.session_state[k]) for k in ("f_dem", "f_ban", "f_tri"))
+            ativos = sum(bool(st.session_state[k]) for k in ("f_rit", "f_dem", "f_ban", "f_tri"))
             with st.popover(f"Filtros{f' ({ativos})' if ativos else ''}", icon=":material/filter_list:",
                             width="stretch"):
                 if periodo_padrao:
@@ -114,7 +114,7 @@ if raw:
                     st.date_input("Distribuídos entre", key="_f_per", min_value=dmin.date(),
                                   max_value=dmax.date(), format="DD/MM/YYYY")
                     st.session_state.f_per = st.session_state._f_per
-                for k, rot, col in (("f_dem", "Tipo de ação", "Demanda"), ("f_ban", "Banco", "Banco - Réu"),
+                for k, rot, col in (("f_rit", "Rito", "Rito (grupo)"), ("f_dem", "Tipo de ação", "Demanda"), ("f_ban", "Banco", "Banco - Réu"),
                                     ("f_tri", "Tribunal", "Tribunal")):
                     _persistir(k, [])
                     st.multiselect(rot, sorted(reg_all[col].dropna().unique()), key="_" + k)
@@ -123,12 +123,13 @@ if raw:
                 st.toggle("Incluir não distribuídos", key="_f_sem")
                 st.session_state.f_sem = st.session_state._f_sem
                 if st.button("Limpar filtros", width="stretch"):
-                    for k in ("f_per", "f_dem", "f_ban", "f_tri", "f_sem"):
+                    for k in ("f_per", "f_rit", "f_dem", "f_ban", "f_tri", "f_sem"):
                         st.session_state.pop(k, None)
                     st.rerun()
 
     periodo, demandas = st.session_state.f_per, st.session_state.f_dem
     bancos, tribunais, incluir_sem_dist = st.session_state.f_ban, st.session_state.f_tri, st.session_state.f_sem
+    ritos = st.session_state.f_rit
 
     reg = reg_all.copy()
     if periodo and len(periodo) == 2:
@@ -137,6 +138,8 @@ if raw:
         reg = reg[dentro | (reg["Distribuição"].isna() & incluir_sem_dist)]
     elif not incluir_sem_dist:
         reg = reg[reg["Distribuição"].notna()]
+    if ritos:
+        reg = reg[reg["Rito (grupo)"].isin(ritos)]
     if demandas:
         reg = reg[reg["Demanda"].isin(demandas)]
     if bancos:

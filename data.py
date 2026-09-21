@@ -206,6 +206,7 @@ def prep_registro(values, hoje: pd.Timestamp) -> pd.DataFrame:
     df["Tribunal"] = tribunal_from_cnj(df["cnj"])
     df["Cliente (base)"] = cliente_base(df["Cliente"])
     df["Situação"] = df["Situação"].astype("string").str.strip().str.capitalize()
+    df["Rito (grupo)"] = df["Rito"].map(_classifica_rito)
     df["Sentença"] = df["Sentença"].astype("string").str.strip()
     df["Tem sentença"] = df["Sentença"].notna()
     df["Resultado"] = df["Sentença"].map(_classifica_sentenca)
@@ -219,6 +220,22 @@ def prep_registro(values, hoje: pd.Timestamp) -> pd.DataFrame:
     df["Dias em curso (calc.)"] = (fim - df["Distribuição"]).dt.days
     df["Encerrado"] = df["Trâns. Julgado"].notna()
     return df
+
+
+RITOS = ["Procedimento comum", "Juizado Especial (JEC)", "Administrativo", "Não informado"]
+
+
+def _classifica_rito(s):
+    if not isinstance(s, str) or not s.strip():
+        return "Não informado"
+    n = _norm(s)
+    if "jec" in n or "juizado" in n or "jef" in n:
+        return "Juizado Especial (JEC)"
+    if n.startswith("adm"):
+        return "Administrativo"
+    if "comum" in n or "ordinari" in n:
+        return "Procedimento comum"
+    return s.strip()
 
 
 def _classifica_sentenca(s):
@@ -307,7 +324,7 @@ def prep_execucao(values) -> pd.DataFrame:
 def quality_report(reg, prz, exe) -> list[str]:
     """Inconsistências que distorcem os indicadores."""
     avisos = []
-    sem_cnj = reg["cnj"].isna() & reg["Nº processo"].notna()
+    sem_cnj = reg["cnj"].isna() & reg["Nº processo"].notna() & (reg["Rito (grupo)"] != "Administrativo")
     if sem_cnj.any():
         avisos.append(f"Registro: {sem_cnj.sum()} nº de processo fora do padrão CNJ.")
     orfaos = prz["cnj"].notna() & ~prz["cnj"].isin(set(reg["cnj"].dropna()) | set(exe["cnj_cump"].dropna()))

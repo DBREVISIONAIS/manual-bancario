@@ -5,6 +5,8 @@ import streamlit as st
 
 from data import EXEC_DATAS
 
+RITOS_JUD = ["Procedimento comum", "Juizado Especial (JEC)"]
+
 # ------------------------------------------------------------------ estilo
 CORES = ["#00315F", "#2F7CC1", "#7FA7D1", "#5B6B7F", "#C9A227", "#3E8E7E", "#B55A4A"]
 COR_RES = {
@@ -30,6 +32,10 @@ def num(v, casas=0):
     return f"{v:,.{casas}f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
+def _txt(v, vazio="–"):
+    return vazio if v is None or (not isinstance(v, str) and pd.isna(v)) or str(v).strip() == "" else str(v)
+
+
 def _chart(fig, h=360):
     fig.update_layout(height=h, margin=dict(l=10, r=10, t=40, b=10), legend_title_text="")
     st.plotly_chart(fig, width="stretch")
@@ -50,6 +56,37 @@ def _tempo_por(df, grupo, col, minimo=1):
          .agg(Processos="count", Mediana="median", Média="mean", Mínimo="min", Máximo="max")
          .reset_index())
     return t[t["Processos"] >= minimo].sort_values("Mediana")
+
+
+def _tabela_resultados(reg, grupo):
+    t = reg.groupby(grupo).agg(
+        Processos=("Cliente", "size"),
+        Sentenciados=("Tem sentença", "sum"),
+        Procedentes=("Resultado", lambda s: s.isin(["Procedente", "Parcialmente procedente"]).sum()),
+        Improcedentes=("Resultado", lambda s: (s == "Improcedente").sum()),
+        Extinções=("Resultado", lambda s: (s == "Extinção sem mérito").sum()),
+        Valor_médio=("Valor da causa", "mean"),
+        Dias_até_sentença=("Distribuição → Sentença", "median"),
+        Em_curso=("Dias em curso (calc.)", "median"),
+    ).reset_index()
+    merito = reg[reg["Resultado"].notna() & (reg["Resultado"] != "Extinção sem mérito")]
+    t["Dias_até_mérito"] = t[grupo].map(merito.groupby(grupo)["Distribuição → Sentença"].median())
+    t["% sentenciado"] = 100 * t["Sentenciados"] / t["Processos"]
+    t["% êxito (entre sentenciados)"] = 100 * t["Procedentes"] / t["Sentenciados"].where(t["Sentenciados"] > 0)
+    cols = [c for c in t.columns if c != "Dias_até_mérito"]
+    cols.insert(cols.index("Dias_até_sentença") + 1, "Dias_até_mérito")
+    return t[cols].sort_values("Processos", ascending=False)
+
+
+_CFG_RES = {
+    "Valor_médio": st.column_config.NumberColumn("Valor médio da causa", format="R$ %.2f"),
+    "Dias_até_sentença": st.column_config.NumberColumn("Mediana até sentença (dias)", format="%.0f"),
+    "Dias_até_mérito": st.column_config.NumberColumn("Mediana até sentença de mérito (dias)", format="%.0f",
+                                                      help="Exclui extinções sem mérito, que encurtam a média."),
+    "Em_curso": st.column_config.NumberColumn("Mediana em curso (dias)", format="%.0f"),
+    "% sentenciado": st.column_config.ProgressColumn(format="%.0f%%", min_value=0, max_value=100),
+    "% êxito (entre sentenciados)": st.column_config.ProgressColumn(format="%.0f%%", min_value=0, max_value=100),
+}
 
 
 # ------------------------------------------------------------------ páginas
@@ -74,6 +111,12 @@ def visao_geral():
     c[2].metric("Prazos cumpridos (total)", num(len(prz)))
     c[3].metric("Mediana distribuição → sentença", f"{num(reg['Distribuição → Sentença'].median())} dias")
 
+    ritos = reg["Rito (grupo)"].value_counts()
+    c = st.columns(max(len(ritos), 1))
+    for col, (rito, n) in zip(c, ritos.items()):
+        sub = reg[reg["Rito (grupo)"] == rito]
+        col.metric(rito, num(n), f"{num(sub['Tem sentença'].sum())} com sentença", delta_color="off")
+
     esq, dir_ = st.columns(2)
     with esq:
         mes = reg.dropna(subset=["Distribuição"]).assign(
@@ -91,41 +134,62 @@ def visao_geral():
         g = reg.groupby("Banco - Réu").size().nlargest(12).sort_values().reset_index(name="Processos")
         _chart(px.bar(g, x="Processos", y="Banco - Réu", orientation="h", title="Bancos mais demandados"), 420)
     with dir_:
-        g = reg.groupby("Tribunal").size().sort_values().reset_index(name="Processos")
-        _chart(px.bar(g, x="Processos", y="Tribunal", orientation="h", title="Processos por tribunal"), 420)
+        g = reg.groupby(["Tribunal", "Rito (grupo)"]).size().reset_index(name="Processos")
+        fig = px.bar(g, x="Processos", y="Tribunal", color="Rito (grupo)", orientation="h",
+                     title="Processos por tribunal e rito", labels={"Rito (grupo)": "Rito"})
+        fig.update_yaxes(categoryorder="total ascending")
+        _chart(fig, 420)
 
 
 def processos():
     reg, prz, _ = _dados()
     st.title("Processos e sentenças")
 
+    st.subheader("Por rito")
+    st.caption("Procedimento comum, Juizado Especial (JEC) e Administrativo seguem lógicas diferentes de prazo, "
+               "recurso e custo. Compare os indicadores sempre dentro do mesmo rito.")
+    tr = _tabela_resultados(reg, "Rito (grupo)")
+    st.dataframe(tr, hide_index=True, width="stretch",
+                 column_config={"Rito (grupo)": "Rito", **_CFG_RES})
+    esq, dir_ = st.columns(2)
+    with esq:
+        g = reg.assign(Resultado=reg["Resultado"].fillna("Sem sentença")).groupby(["Rito (grupo)", "Resultado"]).size()
+        _chart(px.bar(g.reset_index(name="Processos"), x="Rito (grupo)", y="Processos", color="Resultado",
+                      color_discrete_map=COR_RES, title="Resultado por rito", labels={"Rito (grupo)": ""}))
+    with dir_:
+        m = pd.crosstab(reg["Demanda"], reg["Rito (grupo)"])
+        fig = px.imshow(m, text_auto=True, aspect="auto", color_continuous_scale=["#FFFFFF", "#00315F"],
+                        title="Tipo de ação × rito (processos)", labels=dict(x="", y="", color="Processos"))
+        fig.update_coloraxes(showscale=False)
+        _chart(fig)
+    jec = reg[reg["Rito (grupo)"] == "Juizado Especial (JEC)"]
+    if len(jec):
+        ext = (jec["Resultado"] == "Extinção sem mérito").sum()
+        st.caption(f"No JEC, {ext} de {len(jec)} processos foram extintos sem mérito "
+                   f"({num(100 * ext / len(jec), 1)}%). Os motivos estão na coluna Pedidos da planilha.")
+
     st.subheader("Qual tipo de ação tem mais sentença")
-    t = reg.groupby("Demanda").agg(
-        Processos=("Cliente", "size"),
-        Sentenciados=("Tem sentença", "sum"),
-        Procedentes=("Resultado", lambda s: s.isin(["Procedente", "Parcialmente procedente"]).sum()),
-        Improcedentes=("Resultado", lambda s: (s == "Improcedente").sum()),
-        Valor_médio=("Valor da causa", "mean"),
-        Dias_até_sentença=("Distribuição → Sentença", "median"),
-    ).reset_index()
-    t["% sentenciado"] = 100 * t["Sentenciados"] / t["Processos"]
-    t["% êxito (entre sentenciados)"] = 100 * t["Procedentes"] / t["Sentenciados"].where(t["Sentenciados"] > 0)
-    t = t.sort_values("Sentenciados", ascending=False)
-    st.dataframe(t, hide_index=True, width="stretch", column_config={
-        "Valor_médio": st.column_config.NumberColumn("Valor médio da causa", format="R$ %.2f"),
-        "Dias_até_sentença": st.column_config.NumberColumn("Mediana até sentença (dias)", format="%.0f"),
-        "% sentenciado": st.column_config.ProgressColumn(format="%.0f%%", min_value=0, max_value=100),
-        "% êxito (entre sentenciados)": st.column_config.ProgressColumn(format="%.0f%%", min_value=0, max_value=100),
-    })
-    g = reg.assign(Resultado=reg["Resultado"].fillna("Sem sentença")).groupby(["Demanda", "Resultado"]).size()
+    rito_acao = st.segmented_control("Rito", ["Todos"] + [r for r in tr["Rito (grupo)"]], default="Todos",
+                                     key="rito_acao")
+    base = reg if rito_acao in (None, "Todos") else reg[reg["Rito (grupo)"] == rito_acao]
+    t = _tabela_resultados(base, "Demanda").sort_values("Sentenciados", ascending=False)
+    st.dataframe(t, hide_index=True, width="stretch", column_config=_CFG_RES)
+    g = base.assign(Resultado=base["Resultado"].fillna("Sem sentença")).groupby(["Demanda", "Resultado"]).size()
     _chart(px.bar(g.reset_index(name="Processos"), x="Demanda", y="Processos", color="Resultado",
                   color_discrete_map=COR_RES, title="Resultado por tipo de ação"))
 
     st.subheader("Quais tribunais são mais rápidos")
     st.caption("Mediana de dias corridos entre distribuição e sentença, só com processos já sentenciados. "
                "Tribunais com poucos processos têm leitura frágil; use o mínimo abaixo para filtrar.")
-    minimo = st.slider("Mínimo de sentenças por tribunal", 1, 10, 2)
-    rap = _tempo_por(reg, "Tribunal", "Distribuição → Sentença", minimo)
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        rito_trib = st.segmented_control("Rito", ["Todos"] + [r for r in RITOS_JUD if r in set(reg["Rito (grupo)"])],
+                                         default="Procedimento comum" if "Procedimento comum" in set(reg["Rito (grupo)"])
+                                         else "Todos", key="rito_trib")
+    with c2:
+        minimo = st.slider("Mínimo de sentenças por tribunal", 1, 10, 2)
+    base_t = reg if rito_trib in (None, "Todos") else reg[reg["Rito (grupo)"] == rito_trib]
+    rap = _tempo_por(base_t, "Tribunal", "Distribuição → Sentença", minimo)
     if rap.empty:
         st.info("Nenhum tribunal atinge esse mínimo de sentenças.")
     else:
@@ -134,7 +198,7 @@ def processos():
         fig.update_traces(texttemplate="%{text} sent.", textposition="outside")
         fig.update_yaxes(categoryorder="total descending")
         _chart(fig, 80 + 38 * len(rap))
-    abertos = reg[reg["Distribuição"].notna() & ~reg["Tem sentença"]]
+    abertos = base_t[base_t["Distribuição"].notna() & ~base_t["Tem sentença"]]
     if len(abertos):
         a = abertos.groupby("Tribunal")["Dias em curso (calc.)"].agg(["count", "median"]).reset_index()
         a.columns = ["Tribunal", "Aguardando sentença", "Mediana em curso (dias)"]
@@ -148,7 +212,8 @@ def processos():
     resumo = pd.DataFrame({e: reg[e].describe()[["count", "mean", "50%", "min", "max"]] for e in etapas}).T
     resumo.columns = ["Processos", "Média", "Mediana", "Mínimo", "Máximo"]
     st.dataframe(resumo.style.format("{:.0f}"), width="stretch")
-    por = st.radio("Comparar por", ["Demanda", "Banco - Réu", "Tribunal", "Rito"], horizontal=True)
+    por = st.radio("Comparar por", ["Rito (grupo)", "Demanda", "Banco - Réu", "Tribunal"], horizontal=True,
+                   format_func=lambda c: "Rito" if c == "Rito (grupo)" else c)
     etapa = st.selectbox("Etapa", etapas, index=1)
     _chart(px.box(reg.dropna(subset=[etapa]), x=por, y=etapa, points="all",
                   title=f"{etapa} (dias) por {por.lower()}"))
@@ -307,7 +372,7 @@ def clientes():
     if cli:
         r = reg[reg["Cliente (base)"] == cli]
         st.markdown(f"#### {cli}")
-        st.dataframe(r[["Demanda", "Banco - Réu", "Nº processo", "Tribunal", "Distribuição", "Valor da causa",
+        st.dataframe(r[["Demanda", "Rito (grupo)", "Banco - Réu", "Nº processo", "Tribunal", "Distribuição", "Valor da causa",
                         "Sentença", "Data Sent.", "Trâns. Julgado", "Dias em curso (calc.)"]],
                      hide_index=True, width="stretch",
                      column_config={"Valor da causa": st.column_config.NumberColumn(format="R$ %.2f"),
@@ -340,11 +405,11 @@ def ficha():
     c = st.columns(4)
     c[0].metric("Valor da causa", brl(r["Valor da causa"]))
     c[1].metric("Honorários contratuais", brl(r["Contratuais"]))
-    c[2].metric("Tribunal", r["Tribunal"] or "–")
+    c[2].metric("Tribunal", _txt(r["Tribunal"]))
     c[3].metric("Dias em curso", num(r["Dias em curso (calc.)"]))
-    st.markdown(f"**Status:** {r['Status'] or '–'}  |  **Rito:** {r['Rito'] or '–'}  |  "
-                f"**Contratos:** {num(r['Contratos'])}  |  **Sentença:** {r['Sentença'] or 'sem sentença'}  |  "
-                f"**Pedidos:** {r['Pedidos'] or '–'}")
+    st.markdown(f"**Status:** {_txt(r['Status'])}  |  **Rito:** {r['Rito (grupo)']}  |  "
+                f"**Contratos:** {num(r['Contratos'])}  |  **Sentença:** {_txt(r['Sentença'], 'sem sentença')}  |  "
+                f"**Pedidos:** {_txt(r['Pedidos'])}")
     if isinstance(r.get("Bitrix processo"), str) and r["Bitrix processo"].startswith("http"):
         st.link_button("Abrir no Bitrix", r["Bitrix processo"])
 
