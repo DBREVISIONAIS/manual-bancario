@@ -319,6 +319,12 @@ def _classifica_sentenca(s):
 def prep_prazos(values) -> pd.DataFrame:
     df = build_frame(values, TABS["prazos"])
     df = df[df["AUTOR / PEDIDO"].notna()].copy()
+    # a coluna já se chamou "ELABADO" (erro de digitação); aceita os dois nomes
+    if "ELABORADO" not in df.columns:
+        df = df.rename(columns={"ELABADO": "ELABORADO"})
+    if "ELABORADO" not in df.columns:
+        df["ELABORADO"] = pd.NA
+    df["ELABORADO"] = df["ELABORADO"].astype("string").str.strip()
     df["CONCLUSÃO"] = parse_date(df["CONCLUSÃO"])
     df["FATAL"] = parse_date(df["FATAL"])
     df["cnj"] = cnj_digits(df["PROCESSO"])

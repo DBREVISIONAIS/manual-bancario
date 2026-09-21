@@ -427,11 +427,11 @@ def prazos():
         per = st.date_input("Concluídos entre", (dmin.date(), dmax.date()), format="DD/MM/YYYY")
         if len(per) == 2:
             prz = prz[prz["CONCLUSÃO"].between(pd.Timestamp(per[0]), pd.Timestamp(per[1]))]
-    resp = sorted(prz["ELABADO"].dropna().unique())
+    resp = sorted(prz["ELABORADO"].dropna().unique())
     if len(resp) > 1:
-        sel = st.multiselect("Responsável", resp)
+        sel = st.multiselect("Responsável", resp, placeholder="Todos")
         if sel:
-            prz = prz[prz["ELABADO"].isin(sel)]
+            prz = prz[prz["ELABORADO"].isin(sel)]
 
     ant = prz["Antecedência (dias)"]
     c = st.columns(5)
@@ -475,7 +475,7 @@ def prazos():
 
     with st.expander("Todos os lançamentos"):
         st.dataframe(prz[["AUTOR / PEDIDO", "PROCESSO", "SISTEMA", "DEMANDA", "Tipo de peça", "CONCLUSÃO",
-                          "FATAL", "Antecedência (dias)", "ELABADO"]].sort_values("CONCLUSÃO", ascending=False),
+                          "FATAL", "Antecedência (dias)", "ELABORADO"]].sort_values("CONCLUSÃO", ascending=False),
                      hide_index=True, width="stretch",
                      column_config={"CONCLUSÃO": st.column_config.DateColumn(format="DD/MM/YYYY"),
                                     "FATAL": st.column_config.DateColumn(format="DD/MM/YYYY")})
