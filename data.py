@@ -376,6 +376,10 @@ def prep_execucao(values) -> pd.DataFrame:
     for c in EXEC_VALORES:
         if c in df:
             df[c] = parse_money(df[c])
+    # coluna F da planilha: cumprimento de sentença ou acordo
+    df["Tipo"] = (df["Tipo"].astype("string").str.strip().str.capitalize() if "Tipo" in df.columns
+                  else pd.Series("Não informado", index=df.index, dtype="string"))
+    df["Tipo"] = df["Tipo"].fillna("Não informado")
     df["cnj_orig"] = cnj_digits(df["ORIGINARIO"])
     df["cnj_cump"] = cnj_digits(df["CUMPRIMENTO"])
     df["Cliente (base)"] = cliente_base(df["CLIENTE"])

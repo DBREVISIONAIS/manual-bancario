@@ -100,6 +100,7 @@ COR_FASE = {"Não distribuído": "#D9E1EA", "Aguardando sentença": "#7FA7D1", "
             "Em execução": "#C9A227", "Alvará expedido": "#3E8E7E", "Improcedente / extinto": "#B55A4A"}
 MOEDA = lambda rot=None: st.column_config.NumberColumn(rot, format="R$ %.2f")  # noqa: E731
 PCT = st.column_config.NumberColumn("% contratual", format="percent")
+COR_TIPO = {"Cumprimento": "#00315F", "Acordo": "#C9A227", "Não informado": "#7FA7D1"}
 
 
 def _base_fin(reg, exe):
@@ -259,6 +260,17 @@ def financeiro():
     c[2].metric("Sucumbência a receber", brl(receber["Sucumbência (execução)"].sum()))
     c[3].metric("Contratuais a receber", brl(receber["Contratuais (execução)"].sum()))
 
+    if ex["Tipo"].nunique() > 1:
+        t = ex.groupby("Tipo").agg(
+            Execuções=("CLIENTE", "size"), Total=("TOTAL", "sum"), Êxito=("Êxito do cliente", "sum"),
+            Contratuais=("Contratuais (execução)", "sum"), Sucumbência=("Sucumbência (execução)", "sum"),
+            Receita=("Receita do escritório", "sum")).reset_index()
+        st.dataframe(t, hide_index=True, width="stretch", column_config={
+            "Total": MOEDA("Total executado"), "Êxito": MOEDA("Êxito do cliente"), "Contratuais": MOEDA(),
+            "Sucumbência": MOEDA(), "Receita": MOEDA("Receita do escritório")})
+        st.caption("Em acordo, o valor costuma ser negociado e pode não seguir a mesma composição do cumprimento. "
+                   "Confira se a divisão entre sucumbência e êxito do cliente está lançada como no acordo.")
+
     esq, dir_ = st.columns(2)
     with esq:
         g = ex.groupby("Etapa atual")[["Sucumbência (execução)", "Contratuais (execução)"]].sum()
@@ -286,10 +298,11 @@ def financeiro():
         st.warning(f"{len(sem)} cumprimento(s) sem processo correspondente no Registro (o número em ORIGINARIO não "
                    "foi encontrado). Os contratuais deles ficam em branco até o vínculo ser corrigido: "
                    + ", ".join(sem["CLIENTE"].astype(str)))
-    vis = ["CLIENTE", "CUMPRIMENTO", "Etapa atual", "TOTAL", "Êxito do cliente", "% contratual", "Parcela fixa",
-           "Contratuais (execução)", "Sucumbência (execução)", "Receita do escritório", "Repasse ao cliente", "ALVARA"]
+    vis = ["CLIENTE", "Tipo", "CUMPRIMENTO", "Etapa atual", "TOTAL", "Êxito do cliente", "% contratual",
+           "Parcela fixa", "Contratuais (execução)", "Sucumbência (execução)", "Receita do escritório",
+           "Repasse ao cliente", "ALVARA"]
     st.dataframe(ex[vis].sort_values("Receita do escritório", ascending=False), hide_index=True, width="stretch",
-                 column_config={**{c: MOEDA() for c in vis[3:]}, "% contratual": PCT})
+                 column_config={**{c: MOEDA() for c in vis[4:]}, "% contratual": PCT})
 
     st.subheader("Registro × execução, ação por ação")
     st.caption("Para cada ação já em cumprimento: o que o Registro projetava e o que a execução efetivamente "
@@ -298,7 +311,7 @@ def financeiro():
     cols_r = ["cnj", "Cliente", "Banco - Réu", "Valor da causa", "% contratual", "Contratuais", "Honorários Parc.",
               "Sucumbenciais", "Honorários previstos"]
     cmp_ = reg_all[cols_r].merge(
-        ex[["cnj_orig", "Etapa atual", "TOTAL", "Êxito do cliente", "Contratuais (execução)",
+        ex[["cnj_orig", "Tipo", "Etapa atual", "TOTAL", "Êxito do cliente", "Contratuais (execução)",
             "Sucumbência (execução)", "Receita do escritório"]], left_on="cnj", right_on="cnj_orig")
     if cmp_.empty:
         st.info("Nenhum processo do Registro com cumprimento vinculado pelo número CNJ.")
@@ -488,12 +501,24 @@ def execucao():
         st.info("A aba Execução ainda não tem lançamentos.")
         return
 
+    tipos = [t for t in ["Cumprimento", "Acordo", "Não informado"] if t in set(exe["Tipo"])]
+    tipos += [t for t in sorted(set(exe["Tipo"])) if t not in tipos]
+    if len(tipos) > 1:
+        sel = st.segmented_control("Tipo de execução", ["Todos"] + tipos, default="Todos", key="tipo_exec")
+        if sel not in (None, "Todos"):
+            exe = exe[exe["Tipo"] == sel]
+
     c = st.columns(4)
-    c[0].metric("Cumprimentos", num(len(exe)), f"{num(exe['DISTRIB.'].notna().sum())} distribuídos",
-                delta_color="off")
+    c[0].metric("Execuções", num(len(exe)), f"{num(exe['DISTRIB.'].notna().sum())} distribuídas", delta_color="off")
     c[1].metric("Total executado", brl(exe["TOTAL"].sum()))
     c[2].metric("Honorários", brl(exe["HONORARIOS"].sum()))
     c[3].metric("Alvarás expedidos", num(exe["EXP. ALVARÁ"].notna().sum()))
+
+    if len(tipos) > 1:
+        t = exe.groupby("Tipo").agg(Execuções=("CLIENTE", "size"), Total=("TOTAL", "sum"),
+                                    Alvarás=("ALVARA", "sum")).reset_index()
+        st.dataframe(t, hide_index=True, width="stretch",
+                     column_config={"Total": MOEDA("Total executado"), "Alvarás": MOEDA()})
 
     esq, dir_ = st.columns(2)
     with esq:
@@ -508,7 +533,7 @@ def execucao():
                      column_config={"Média (dias)": st.column_config.NumberColumn(format="%.0f"),
                                     "Mediana (dias)": st.column_config.NumberColumn(format="%.0f")})
 
-    vis = ["CLIENTE", "ORIGINARIO", "CUMPRIMENTO", "TRIBUNAL", "Etapa atual"] + EXEC_DATAS + \
+    vis = ["CLIENTE", "Tipo", "ORIGINARIO", "CUMPRIMENTO", "TRIBUNAL", "Etapa atual"] + EXEC_DATAS + \
           [c for c in ["TOTAL", "HONORARIOS", "REPETIÇÃO", "MULTA 10%", "HON. 10%", "ALVARA"] if c in exe]
     cfg = {c: st.column_config.DateColumn(format="DD/MM/YYYY") for c in EXEC_DATAS}
     cfg.update({c: st.column_config.NumberColumn(format="R$ %.2f")
@@ -604,9 +629,10 @@ def clientes():
 
     if len(ec):
         st.markdown("**Execuções**")
-        vis = ["CLIENTE", "CUMPRIMENTO", "Etapa atual", "TOTAL", "Êxito do cliente", "Parcela fixa",
-               "Sucumbência (execução)", "Contratuais (execução)", "Receita do escritório", "Repasse ao cliente", "ALVARA"]
-        st.dataframe(ec[vis], hide_index=True, width="stretch", column_config={c: MOEDA() for c in vis[3:]})
+        vis = ["CLIENTE", "Tipo", "CUMPRIMENTO", "Etapa atual", "TOTAL", "Êxito do cliente", "Parcela fixa",
+               "Sucumbência (execução)", "Contratuais (execução)", "Receita do escritório", "Repasse ao cliente",
+               "ALVARA"]
+        st.dataframe(ec[vis], hide_index=True, width="stretch", column_config={c: MOEDA() for c in vis[4:]})
 
     p = prz[prz["cnj"].isin(rc["cnj"]) | (prz["Cliente (base)"] == cli)]
     with st.expander(f"Prazos ({len(p)})"):
