@@ -237,15 +237,32 @@ def load_from_xlsx(file) -> dict[str, list[list[str]]]:
 
 # ---------------------------------------------------------------- tratamento
 
+def _padroniza(df: pd.DataFrame, canonicos: list[str]) -> pd.DataFrame:
+    """Aceita variações de acento, caixa e espaço nos títulos ('ALVARÁ' -> 'ALVARA')
+    e cria vazias as colunas esperadas que a planilha não tiver, para o painel não quebrar."""
+    alvo = {_norm(c): c for c in canonicos}
+    df = df.rename(columns=lambda c: alvo.get(_norm(c), c))
+    faltando = [c for c in canonicos if c not in df.columns]
+    for c in faltando:
+        df[c] = pd.NA
+    df.attrs["colunas_ausentes"] = faltando
+    return df
+
+
+REG_COLUNAS = ["Cliente", "Situação", "Demanda", "Banco - Réu", "Assinatura", "Valor da causa", "Causa s/ danos",
+               "Contratuais", "Honorários Parc.", "Sucumbenciais", "Contratos", "Status", "Rito", "Distribuição",
+               "UF", "Nº processo", "Prazos", "Sentença", "Data Sent.", "Pedidos", "Trâns. Julgado", "Execução",
+               "Bitrix processo"]
+
+
 def prep_registro(values, hoje: pd.Timestamp) -> pd.DataFrame:
     df = build_frame(values, TABS["registro"])
     totais = df.attrs.get("totais", {})
     df = df[df["Cliente"].notna()].copy()
     # "Honorários Parc." = parcela fixa dos contratuais (ex.: R$ 500 em só uma das ações do contrato).
     # Planilhas antigas não têm a coluna: ela é criada vazia e a execução usa o valor padrão das premissas.
-    tem_parc = "Honorários Parc." in df.columns
-    if not tem_parc:
-        df["Honorários Parc."] = pd.NA
+    tem_parc = _norm("Honorários Parc.") in [_norm(c) for c in df.columns]
+    df = _padroniza(df, REG_COLUNAS)
     VALORES = ["Valor da causa", "Causa s/ danos", "Contratuais", "Honorários Parc.", "Sucumbenciais"]
     for c in VALORES:
         df[c] = parse_money(df[c])
@@ -319,11 +336,9 @@ def _classifica_sentenca(s):
 def prep_prazos(values) -> pd.DataFrame:
     df = build_frame(values, TABS["prazos"])
     df = df[df["AUTOR / PEDIDO"].notna()].copy()
-    # a coluna já se chamou "ELABADO" (erro de digitação); aceita os dois nomes
-    if "ELABORADO" not in df.columns:
-        df = df.rename(columns={"ELABADO": "ELABORADO"})
-    if "ELABORADO" not in df.columns:
-        df["ELABORADO"] = pd.NA
+    # a coluna já se chamou "ELABADO" (erro de digitação na planilha); aceita os dois nomes
+    df = df.rename(columns={c: "ELABORADO" for c in df.columns if _norm(c) in ("elabado", "elaborado")})
+    df = _padroniza(df, ["AUTOR / PEDIDO", "PROCESSO", "SISTEMA", "DEMANDA", "CONCLUSÃO", "FATAL", "ELABORADO"])
     df["ELABORADO"] = df["ELABORADO"].astype("string").str.strip()
     df["CONCLUSÃO"] = parse_date(df["CONCLUSÃO"])
     df["FATAL"] = parse_date(df["FATAL"])
@@ -370,16 +385,13 @@ EXEC_VALORES = ["TOTAL", "HONORARIOS", "REPETIÇÃO", "MULTA 10%", "HON. 10%", "
 def prep_execucao(values) -> pd.DataFrame:
     df = build_frame(values, TABS["execucao"])
     df = df[df["CLIENTE"].notna()].copy()
+    df = _padroniza(df, EXEC_DATAS + EXEC_VALORES + ["Tipo", "CLIENTE", "ORIGINARIO", "CUMPRIMENTO", "TRIBUNAL"])
     for c in EXEC_DATAS:
-        if c in df:
-            df[c] = parse_date(df[c])
+        df[c] = parse_date(df[c])
     for c in EXEC_VALORES:
-        if c in df:
-            df[c] = parse_money(df[c])
+        df[c] = parse_money(df[c])
     # coluna F da planilha: cumprimento de sentença ou acordo
-    df["Tipo"] = (df["Tipo"].astype("string").str.strip().str.capitalize() if "Tipo" in df.columns
-                  else pd.Series("Não informado", index=df.index, dtype="string"))
-    df["Tipo"] = df["Tipo"].fillna("Não informado")
+    df["Tipo"] = df["Tipo"].astype("string").str.strip().str.capitalize().fillna("Não informado")
     df["cnj_orig"] = cnj_digits(df["ORIGINARIO"])
     df["cnj_cump"] = cnj_digits(df["CUMPRIMENTO"])
     df["Cliente (base)"] = cliente_base(df["CLIENTE"])
@@ -458,6 +470,12 @@ def fase_financeira(reg: pd.DataFrame, exe: pd.DataFrame) -> pd.Series:
 def quality_report(reg, prz, exe) -> list[str]:
     """Inconsistências que distorcem os indicadores."""
     avisos = []
+    for nome, df in (("Registro", reg), ("Prazos", prz), ("Execução", exe)):
+        falt = df.attrs.get("colunas_ausentes") or []
+        falt = [c for c in falt if c not in ("Honorários Parc.", "Tipo")]  # tratadas à parte
+        if falt:
+            avisos.append(f"{nome}: a planilha não tem a(s) coluna(s) {', '.join(falt)}. O painel trata como vazia "
+                          "e os indicadores que dependem dela ficam zerados.")
     totais = dict(reg.attrs.get("totais", {}))
     # a linha de cima só serve de conferência se for o total geral: com filtro ativo na planilha
     # ela vira SUBTOTAL parcial. O total de Contratos (inteiros, sem ambiguidade) indica qual é o caso.
