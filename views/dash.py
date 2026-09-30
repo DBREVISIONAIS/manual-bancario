@@ -120,7 +120,7 @@ def visao_geral():
     c[1].metric("Clientes", num(reg["Cliente (base)"].nunique()),
                 f"{num(len(reg) / max(reg['Cliente (base)'].nunique(), 1), 2)} ações por cliente", delta_color="off")
     c[2].metric("Valor da causa médio", brl(reg["Valor da causa"].mean()),
-                f"mediana {brl(reg['Valor da causa'].median())}", delta_color="off")
+                f"mediana {brl_md(reg['Valor da causa'].median())}", delta_color="off")
     c[3].metric("Com sentença", num(sentenciados.sum()),
                 f"{num(100 * sentenciados.mean(), 1)}% dos processos", delta_color="off")
 
@@ -249,14 +249,14 @@ def financeiro():
     c[0].metric("Total executado", brl(ex["TOTAL"].sum()), f"{num(ex['TOTAL'].notna().sum())} cumprimentos com valor",
                 delta_color="off")
     c[1].metric("Receita do escritório", brl(ex["Receita do escritório"].sum()),
-                f"sucumbência {brl(ex['Sucumbência (execução)'].sum())}", delta_color="off")
+                f"sucumbência {brl_md(ex['Sucumbência (execução)'].sum())}", delta_color="off")
     c[2].metric("Contratuais na execução", brl(ex["Contratuais (execução)"].sum()),
-                f"sobre êxito de {brl(ex['Êxito do cliente'].sum())}", delta_color="off")
+                f"sobre êxito de {brl_md(ex['Êxito do cliente'].sum())}", delta_color="off")
     c[3].metric("Repasse estimado aos clientes", brl(ex["Repasse ao cliente"].sum()))
     c = st.columns(4)
     c[0].metric("A receber", brl(receber["Receita do escritório"].sum()))
     c[1].metric("Já recebido", brl(recebido["Receita do escritório"].sum()),
-                f"valor recebido: {brl(recebido['Valor recebido'].sum())}", delta_color="off")
+                f"valor recebido: {brl_md(recebido['Valor recebido'].sum())}", delta_color="off")
     c[2].metric("Sucumbência a receber", brl(receber["Sucumbência (execução)"].sum()))
     c[3].metric("Contratuais a receber", brl(receber["Contratuais (execução)"].sum()))
 
@@ -541,22 +541,27 @@ def execucao():
 
     # ---------------------------------------------------------------- resumo
     st.subheader("Resumo financeiro")
+    st.caption("Valor bruto é o TOTAL do depósito ou do acordo, com a parte do cliente dentro. Honorários são só o "
+               "que fica com o escritório: sucumbência (HONORARIOS + HON. 10%) mais contratuais (CONTRATUAIS % + "
+               "CONTRATUAIS PARC.). Líquido do cliente é a coluna LIQUIDO CLIENTE.")
+    hon, suc, con = "Receita do escritório", "Sucumbência (execução)", "Contratuais (execução)"
+    st.markdown("**Valor bruto (TOTAL)**")
     c = st.columns(4)
     c[0].metric("Execuções", num(len(ex)), f"{num(ex['DISTRIB.'].notna().sum())} distribuídas", delta_color="off")
-    c[1].metric("Total executado", brl(ex["TOTAL"].sum()), f"média {brl(ex['TOTAL'].mean())} por execução",
-                delta_color="off")
-    c[2].metric("Receita do escritório", brl(ex["Receita do escritório"].sum()),
-                f"sucumbência {brl(ex['Sucumbência (execução)'].sum())} + contratuais "
-                f"{brl(ex['Contratuais (execução)'].sum())}", delta_color="off")
-    c[3].metric("Repasse aos clientes", brl(ex["Repasse ao cliente"].sum()),
-                f"sobre êxito de {brl(ex['Êxito do cliente'].sum())}", delta_color="off")
+    c[1].metric("Bruto executado", brl(ex["TOTAL"].sum()))
+    c[2].metric("Bruto já recebido", brl(rec["TOTAL"].sum()), f"{num(len(rec))} execuções", delta_color="off")
+    c[3].metric("Bruto a receber", brl(pend["TOTAL"].sum()), f"{num(len(pend))} execuções", delta_color="off")
+    st.markdown("**Honorários do escritório**")
     c = st.columns(4)
-    c[0].metric("Já recebido", brl(rec["TOTAL"].sum()), f"{num(len(rec))} execuções", delta_color="off")
-    c[1].metric("Receita já recebida", brl(rec["Receita do escritório"].sum()))
-    c[2].metric("A receber", brl(pend["TOTAL"].sum()), f"{num(len(pend))} execuções", delta_color="off")
-    c[3].metric("Receita a receber", brl(pend["Receita do escritório"].sum()),
-                f"sucumbência {brl(pend['Sucumbência (execução)'].sum())} + contratuais "
-                f"{brl(pend['Contratuais (execução)'].sum())}", delta_color="off")
+    c[0].metric("Honorários (total)", brl(ex[hon].sum()), help="Sucumbência + contratuais")
+    c[1].metric("Sucumbência", brl(ex[suc].sum()), help="HONORARIOS + HON. 10%")
+    c[2].metric("Contratuais", brl(ex[con].sum()), help="CONTRATUAIS % + CONTRATUAIS PARC.")
+    c[3].metric("Líquido dos clientes", brl(ex["Repasse ao cliente"].sum()), help="Coluna LIQUIDO CLIENTE")
+    c = st.columns(4)
+    c[0].metric("Honorários já recebidos", brl(rec[hon].sum()))
+    c[1].metric("Honorários a receber", brl(pend[hon].sum()))
+    c[2].metric("Sucumbência a receber", brl(pend[suc].sum()))
+    c[3].metric("Contratuais a receber", brl(pend[con].sum()))
 
     # ---------------------------------------------------------------- composição
     comp_cols = {"HONORARIOS": "Sucumbência fixada", "HON. 10%": "Honorários 10% (art. 523)",
@@ -754,9 +759,9 @@ def clientes():
     c = st.columns(4)
     c[0].metric("Ações", num(len(rc)), f"{num(rc['Tem sentença'].sum())} com sentença", delta_color="off")
     c[1].metric("Valor da causa", brl(rc["Valor da causa"].sum()),
-                f"sem danos: {brl(rc['Causa s/ danos'].sum())}", delta_color="off")
+                f"sem danos: {brl_md(rc['Causa s/ danos'].sum())}", delta_color="off")
     c[2].metric("Contratuais previstos", brl(rc["Contratuais (total)"].sum()),
-                f"parcela fixa: {brl(rc['Honorários Parc.'].sum())}", delta_color="off")
+                f"parcela fixa: {brl_md(rc['Honorários Parc.'].sum())}", delta_color="off")
     c[3].metric("Sucumbência prevista", brl(rc["Sucumbenciais"].sum()))
     c = st.columns(4)
     c[0].metric("Honorários previstos", brl(rc["Honorários previstos"].sum()))
@@ -807,7 +812,7 @@ def ficha():
     c = st.columns(4)
     c[0].metric("Valor da causa", brl(r["Valor da causa"]))
     c[1].metric("Honorários contratuais", brl(r["Contratuais (total)"]),
-                f"parcela fixa: {brl(r['Honorários Parc.'])}", delta_color="off")
+                f"parcela fixa: {brl_md(r['Honorários Parc.'])}", delta_color="off")
     c[2].metric("Tribunal", _txt(r["Tribunal"]))
     c[3].metric("Dias em curso", num(r["Dias em curso (calc.)"]))
     st.markdown(f"**Status:** {_txt(r['Status'])}  |  **Rito:** {r['Rito (grupo)']}{'  |  **Benefício:** ' + r['Benefício'] if isinstance(r.get('Benefício'), str) else ''}  |  "
