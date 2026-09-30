@@ -104,9 +104,67 @@ COR_TIPO = {"Cumprimento": "#00315F", "Acordo": "#C9A227", "Não informado": "#7
 
 
 def _base_fin(reg, exe):
-    ex = financeiro_execucao(exe, st.session_state.get("reg_all"))
+    ex = _ex_recorte(financeiro_execucao(exe, st.session_state.get("reg_all")), reg)
+    if ex.empty:
+        st.info("Nenhuma execução no recorte atual.")
+        return
     r = reg.assign(**{"Fase financeira": fase_financeira(reg, exe)})
     return r, ex
+
+
+COLS_EXEC_NOVAS = ["RECEBIMENTO", "CONTRATUAIS PARC.", "CONTRATUAIS %", "LIQUIDO CLIENTE"]
+
+
+def _ex_recorte(ex_all, r):
+    """Mesmo recorte nas telas Financeiro e Execução: com filtro ativo, ficam as execuções dos processos
+    filtrados e as que não têm vínculo com o Registro (não há como filtrá-las)."""
+    if st.session_state.get("filtrado"):
+        return ex_all[ex_all["cnj_orig"].isin(r["cnj"]) | ~ex_all["Vínculo com o Registro"]]
+    return ex_all
+
+
+def _aviso_colunas_execucao():
+    falt = [c for c in (st.session_state.exe.attrs.get("colunas_ausentes") or []) if c in COLS_EXEC_NOVAS]
+    if falt:
+        st.error("O painel não está recebendo da aba Execução a(s) coluna(s) " + ", ".join(falt) + ". "
+                 "Sem elas, os valores abaixo saem de cálculo, não da planilha. Se o painel lê a planilha auxiliar "
+                 "(IMPORTRANGE), amplie o intervalo da aba Execução para \"Execução!A:Z\".")
+
+
+def _cartoes_execucao(ex):
+    """Cartões de valores da execução, iguais nas telas Financeiro e Execução."""
+    hon, suc, con, liq = "Receita do escritório", "Sucumbência (execução)", "Contratuais (execução)", "Repasse ao cliente"
+    rec, pend = ex[ex["Recebido"]], ex[~ex["Recebido"]]
+    st.caption("Valor bruto é o TOTAL do depósito ou do acordo, com a parte do cliente dentro. Honorários são só o "
+               "que fica com o escritório: sucumbência (HONORARIOS + HON. 10%) mais contratuais (CONTRATUAIS % + "
+               "CONTRATUAIS PARC.). Líquido do cliente é a coluna LIQUIDO CLIENTE.")
+    st.markdown("**Valor bruto (TOTAL)**")
+    c = st.columns(4)
+    c[0].metric("Execuções", num(len(ex)), f"{num(ex['DISTRIB.'].notna().sum())} distribuídas", delta_color="off")
+    c[1].metric("Bruto executado", brl(ex["TOTAL"].sum()), help="Soma da coluna TOTAL")
+    c[2].metric("Bruto já recebido", brl(rec["TOTAL"].sum()), f"{num(len(rec))} execuções", delta_color="off",
+                help="TOTAL das linhas com data em RECEBIMENTO")
+    c[3].metric("Bruto a receber", brl(pend["TOTAL"].sum()), f"{num(len(pend))} execuções", delta_color="off",
+                help="TOTAL das linhas sem data em RECEBIMENTO")
+    st.markdown("**Honorários do escritório e líquido dos clientes**")
+    blocos = [("", ex), (" já recebidos", rec), (" a receber", pend)]
+    for sufixo, d in blocos:
+        c = st.columns(4)
+        tag = {"": "", " já recebidos": " das linhas já recebidas", " a receber": " das linhas ainda não recebidas"}[sufixo]
+        c[0].metric(f"Honorários{sufixo or ' (total)'}", brl(d[hon].sum()),
+                    help=f"Sucumbência + contratuais{tag}")
+        c[1].metric("Sucumbência" + ("" if not sufixo else (" recebida" if "já" in sufixo else " a receber")),
+                    brl(d[suc].sum()), help=f"HONORARIOS + HON. 10%{tag}")
+        c[2].metric("Contratuais" + ("" if not sufixo else (" recebidos" if "já" in sufixo else " a receber")),
+                    brl(d[con].sum()), help=f"CONTRATUAIS % + CONTRATUAIS PARC.{tag}")
+        c[3].metric("Líquido dos clientes" + ("" if not sufixo else (" repassado" if "já" in sufixo else " a repassar")),
+                    brl(d[liq].sum()), help=f"Coluna LIQUIDO CLIENTE{tag}")
+    dif = ex["TOTAL"] - ex[[hon, liq]].sum(axis=1, min_count=1)
+    ruins = ex[ex["TOTAL"].notna() & (dif.abs() > 0.05)]
+    if len(ruins):
+        st.warning(f"Em {len(ruins)} linha(s), honorários + líquido do cliente não fecham com o TOTAL "
+                   f"(diferença somada: {brl_md(dif[ruins.index].sum())}). Veja a conferência linha a linha na tela "
+                   "Execução e recebimentos: " + ", ".join(ruins["CLIENTE"].astype(str).head(5)))
 
 # ------------------------------------------------------------------ páginas
 def visao_geral():
@@ -163,15 +221,11 @@ def visao_geral():
 def financeiro():
     reg, _, exe_all = _dados()
     st.title("Financeiro")
-    st.caption("Tudo parte da aba Registro: cada ação tem o seu percentual (Contratuais ÷ Valor da causa) e a sua "
-               "parcela fixa (Honorários Parc.). A execução usa esses mesmos termos, ação por ação, ligando o "
-               "cumprimento ao processo originário pelo número CNJ.")
+    st.caption("A carteira projetada vem da aba Registro. Os valores das execuções vêm da aba Execução "
+               "(TOTAL, HONORARIOS, HON. 10%, CONTRATUAIS %, CONTRATUAIS PARC. e LIQUIDO CLIENTE), ligada ao "
+               "processo originário pelo número CNJ.")
     r, ex_all = _base_fin(reg, exe_all)
-    # execuções só dos processos que passaram pelos filtros (as sem vínculo com o Registro entram sem filtro)
-    if st.session_state.get("filtrado"):
-        ex = ex_all[ex_all["cnj_orig"].isin(r["cnj"])]
-    else:
-        ex = ex_all
+    ex = _ex_recorte(ex_all, r)
 
     st.subheader("Carteira projetada")
     st.caption("Valores da aba Registro. É a projeção se cada ação for julgada procedente como pedida: "
@@ -243,22 +297,8 @@ def financeiro():
     if ex.empty:
         st.info("Nenhum cumprimento de sentença no recorte atual.")
         return
-    receber = ex[~ex["Recebido"]]
-    recebido = ex[ex["Recebido"]]
-    c = st.columns(4)
-    c[0].metric("Total executado", brl(ex["TOTAL"].sum()), f"{num(ex['TOTAL'].notna().sum())} cumprimentos com valor",
-                delta_color="off")
-    c[1].metric("Receita do escritório", brl(ex["Receita do escritório"].sum()),
-                f"sucumbência {brl_md(ex['Sucumbência (execução)'].sum())}", delta_color="off")
-    c[2].metric("Contratuais na execução", brl(ex["Contratuais (execução)"].sum()),
-                f"sobre êxito de {brl_md(ex['Êxito do cliente'].sum())}", delta_color="off")
-    c[3].metric("Repasse estimado aos clientes", brl(ex["Repasse ao cliente"].sum()))
-    c = st.columns(4)
-    c[0].metric("A receber", brl(receber["Receita do escritório"].sum()))
-    c[1].metric("Já recebido", brl(recebido["Receita do escritório"].sum()),
-                f"valor recebido: {brl_md(recebido['Valor recebido'].sum())}", delta_color="off")
-    c[2].metric("Sucumbência a receber", brl(receber["Sucumbência (execução)"].sum()))
-    c[3].metric("Contratuais a receber", brl(receber["Contratuais (execução)"].sum()))
+    _aviso_colunas_execucao()
+    _cartoes_execucao(ex)
 
     if ex["Tipo"].nunique() > 1:
         t = ex.groupby("Tipo").agg(
@@ -516,7 +556,7 @@ def _previsao_recebimento(ex, hoje):
 
 
 def execucao():
-    _, _, exe = _dados()
+    reg, _, exe = _dados()
     st.title("Execução e recebimentos")
     if exe.empty:
         st.info("A aba Execução ainda não tem lançamentos.")
@@ -541,27 +581,8 @@ def execucao():
 
     # ---------------------------------------------------------------- resumo
     st.subheader("Resumo financeiro")
-    st.caption("Valor bruto é o TOTAL do depósito ou do acordo, com a parte do cliente dentro. Honorários são só o "
-               "que fica com o escritório: sucumbência (HONORARIOS + HON. 10%) mais contratuais (CONTRATUAIS % + "
-               "CONTRATUAIS PARC.). Líquido do cliente é a coluna LIQUIDO CLIENTE.")
-    hon, suc, con = "Receita do escritório", "Sucumbência (execução)", "Contratuais (execução)"
-    st.markdown("**Valor bruto (TOTAL)**")
-    c = st.columns(4)
-    c[0].metric("Execuções", num(len(ex)), f"{num(ex['DISTRIB.'].notna().sum())} distribuídas", delta_color="off")
-    c[1].metric("Bruto executado", brl(ex["TOTAL"].sum()))
-    c[2].metric("Bruto já recebido", brl(rec["TOTAL"].sum()), f"{num(len(rec))} execuções", delta_color="off")
-    c[3].metric("Bruto a receber", brl(pend["TOTAL"].sum()), f"{num(len(pend))} execuções", delta_color="off")
-    st.markdown("**Honorários do escritório**")
-    c = st.columns(4)
-    c[0].metric("Honorários (total)", brl(ex[hon].sum()), help="Sucumbência + contratuais")
-    c[1].metric("Sucumbência", brl(ex[suc].sum()), help="HONORARIOS + HON. 10%")
-    c[2].metric("Contratuais", brl(ex[con].sum()), help="CONTRATUAIS % + CONTRATUAIS PARC.")
-    c[3].metric("Líquido dos clientes", brl(ex["Repasse ao cliente"].sum()), help="Coluna LIQUIDO CLIENTE")
-    c = st.columns(4)
-    c[0].metric("Honorários já recebidos", brl(rec[hon].sum()))
-    c[1].metric("Honorários a receber", brl(pend[hon].sum()))
-    c[2].metric("Sucumbência a receber", brl(pend[suc].sum()))
-    c[3].metric("Contratuais a receber", brl(pend[con].sum()))
+    _aviso_colunas_execucao()
+    _cartoes_execucao(ex)
 
     # ---------------------------------------------------------------- composição
     comp_cols = {"HONORARIOS": "Sucumbência fixada", "HON. 10%": "Honorários 10% (art. 523)",
@@ -680,6 +701,26 @@ def execucao():
     if len(lim):
         st.warning(f"Em {len(lim)} execução(ões) CONTRATUAIS % + CONTRATUAIS PARC. passaria do êxito do cliente; "
                    "o painel limitou os contratuais ao êxito (repasse zero): " + ", ".join(lim["CLIENTE"].astype(str)))
+
+    # ---------------------------------------------------------------- conferência
+    st.subheader("Conferência linha a linha")
+    st.caption("O que o painel leu de cada coluna e o que calculou. A última coluna precisa dar zero: "
+               "TOTAL − (sucumbência + contratuais + líquido do cliente).")
+    conf = ex.assign(**{"Fecha com o TOTAL": ex["TOTAL"] - ex[["Receita do escritório", "Repasse ao cliente"]]
+                        .sum(axis=1, min_count=1)})
+    cc = ["CLIENTE", "Tipo", "Situação", "TOTAL", "HONORARIOS", "HON. 10%", "REPETIÇÃO", "MULTA 10%",
+          "CONTRATUAIS PARC.", "CONTRATUAIS %", "LIQUIDO CLIENTE", "Sucumbência (execução)",
+          "Contratuais (execução)", "Receita do escritório", "Repasse ao cliente", "Origem dos contratuais",
+          "Origem do repasse", "Fecha com o TOTAL"]
+    ccfg = {c: MOEDA() for c in cc[3:15] + ["Fecha com o TOTAL"]}
+    ccfg.update({"Sucumbência (execução)": MOEDA("Sucumbência (painel)"),
+                 "Contratuais (execução)": MOEDA("Contratuais (painel)"),
+                 "Receita do escritório": MOEDA("Honorários (painel)"),
+                 "Repasse ao cliente": MOEDA("Líquido (painel)")})
+    so_erro = st.toggle("Mostrar só as linhas que não fecham", key="conf_so_erro")
+    if so_erro:
+        conf = conf[conf["Fecha com o TOTAL"].abs() > 0.05]
+    st.dataframe(conf[cc], hide_index=True, width="stretch", column_config=ccfg)
 
     # ---------------------------------------------------------------- tabela
     st.subheader("Execuções")
