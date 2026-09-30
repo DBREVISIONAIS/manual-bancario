@@ -683,9 +683,11 @@ def execucao():
             "Contratuais (execução)", "Receita do escritório", "Repasse ao cliente", "ORIGINARIO", "CUMPRIMENTO"])
     moeda = ["TOTAL", "HONORARIOS", "REPETIÇÃO", "MULTA 10%", "HON. 10%", "CONTRATUAIS PARC.", "CONTRATUAIS %",
              "Contratuais (execução)", "Receita do escritório", "Repasse ao cliente"]
+    cfg_rep = MOEDA("LIQUIDO CLIENTE")
     cfg = {c: st.column_config.DateColumn(format="DD/MM/YYYY") for c in EXEC_DATAS + ["Previsão de recebimento"]}
     cfg.update({c: MOEDA() for c in moeda})
     cfg["Contratuais (execução)"] = MOEDA("Contratuais (total)")
+    cfg["Repasse ao cliente"] = cfg_rep
     st.dataframe(ex[vis].sort_values(["Situação", "Previsão de recebimento"]), hide_index=True, width="stretch",
                  column_config=cfg)
 

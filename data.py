@@ -379,7 +379,8 @@ def _tipo_peca(s):
 
 
 EXEC_DATAS = ["DISTRIB.", "SISBAJUD", "BLOQUEIO", "PED. ALVARÁ", "RECEBIMENTO"]
-EXEC_VALORES = ["TOTAL", "HONORARIOS", "REPETIÇÃO", "MULTA 10%", "HON. 10%", "CONTRATUAIS PARC.", "CONTRATUAIS %"]
+EXEC_VALORES = ["TOTAL", "HONORARIOS", "REPETIÇÃO", "MULTA 10%", "HON. 10%", "CONTRATUAIS PARC.", "CONTRATUAIS %",
+                "LIQUIDO CLIENTE"]
 
 
 def prep_execucao(values) -> pd.DataFrame:
@@ -389,6 +390,7 @@ def prep_execucao(values) -> pd.DataFrame:
     TOTAL (acordo ou depósito) = HONORARIOS + REPETIÇÃO + MULTA 10% + HON. 10% (art. 523 do CPC).
     CONTRATUAIS % = percentual do caso sobre a parte do cliente (REPETIÇÃO + MULTA 10%), em R$.
     CONTRATUAIS PARC. = parcela fixa dos contratuais, puxada por fórmula do Registro, em R$.
+    LIQUIDO CLIENTE = o que o cliente recebe, já descontados os contratuais (fórmula da planilha).
     """
     df = build_frame(values, TABS["execucao"])
     df = df[df["CLIENTE"].notna()].copy()
@@ -460,7 +462,10 @@ def financeiro_execucao(exe: pd.DataFrame, reg_all: pd.DataFrame | None) -> pd.D
     df["Contratuais limitados ao êxito"] = (bruto > exito).fillna(False).astype(bool)
     df["Contratuais (execução)"] = bruto.where(~df["Contratuais limitados ao êxito"], exito)
     df["Receita do escritório"] = df[["Sucumbência (execução)", "Contratuais (execução)"]].sum(axis=1, min_count=1)
-    df["Repasse ao cliente"] = exito - df["Contratuais (execução)"].fillna(0)
+    # repasse: vale o LIQUIDO CLIENTE da planilha; o cálculo só entra quando a célula está vazia
+    df["Repasse (cálculo do painel)"] = exito - df["Contratuais (execução)"].fillna(0)
+    df["Repasse ao cliente"] = df["LIQUIDO CLIENTE"].fillna(df["Repasse (cálculo do painel)"])
+    df["Origem do repasse"] = df["LIQUIDO CLIENTE"].notna().map({True: "Planilha", False: "Cálculo do painel"})
     return df
 
 
@@ -524,12 +529,22 @@ def quality_report(reg, prz, exe) -> list[str]:
     if fora.any():
         avisos.append("Execução: Tipo fora do padrão (use Cumprimento ou Acordo): "
                       + ", ".join(sorted(exe.loc[fora, "Tipo"].astype(str).unique())) + ".")
-    for col in ("CONTRATUAIS %", "CONTRATUAIS PARC."):
+    for col in ("CONTRATUAIS %", "CONTRATUAIS PARC.", "LIQUIDO CLIENTE"):
         vazio = exe_ok[col].isna()
         if vazio.any():
             avisos.append(f"Execução: {vazio.sum()} linha(s) com TOTAL e sem {col} "
                           f"({', '.join(exe_ok.loc[vazio, 'CLIENTE'].astype(str).head(4))}). "
-                          "O painel usa o valor do processo no Registro, se houver vínculo pelo número CNJ.")
+                          + ("O painel calcula REPETIÇÃO + MULTA 10% menos os contratuais." if col == "LIQUIDO CLIENTE"
+                             else "O painel usa o valor do processo no Registro, se houver vínculo pelo número CNJ."))
+    if exe["LIQUIDO CLIENTE"].notna().any():
+        f = financeiro_execucao(exe, None)
+        dif = f[(f["LIQUIDO CLIENTE"] - f["Repasse (cálculo do painel)"]).abs() > 0.05]
+        if len(dif):
+            fmt = lambda v: f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+            avisos.append("Execução: LIQUIDO CLIENTE diferente de REPETIÇÃO + MULTA 10% − CONTRATUAIS % − "
+                          "CONTRATUAIS PARC. em " + "; ".join(
+                              f"{r.CLIENTE} (planilha {fmt(r['LIQUIDO CLIENTE'])}, conta {fmt(r['Repasse (cálculo do painel)'])})"
+                              for _, r in dif.head(5).iterrows()) + ". O painel usa o valor da planilha.")
     if reg.attrs.get("tem_parc"):
         # contagem dobrada: Contratuais (H) ainda com a parcela fixa embutida depois de criada a coluna I
         c = reg.dropna(subset=["Contratuais", "Valor da causa", "Honorários Parc."])
