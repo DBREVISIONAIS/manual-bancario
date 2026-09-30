@@ -458,8 +458,10 @@ def financeiro_execucao(exe: pd.DataFrame, reg_all: pd.DataFrame | None) -> pd.D
     df["Contratuais % (R$)"] = variavel
     df["% contratual"] = (variavel / exito).where(exito > 0)
 
-    bruto = (variavel + df["Parcela fixa"].fillna(0)).where((exito > 0) & variavel.notna())
-    df["Contratuais limitados ao êxito"] = (bruto > exito).fillna(False).astype(bool)
+    # o valor da planilha manda: CONTRATUAIS % preenchido entra mesmo sem êxito lançado;
+    # parcela fixa vazia (sem valor na planilha nem no Registro) conta como R$ 0
+    bruto = (variavel + df["Parcela fixa"].fillna(0)).where(variavel.notna())
+    df["Contratuais limitados ao êxito"] = ((exito > 0) & (bruto > exito)).fillna(False).astype(bool)
     df["Contratuais (execução)"] = bruto.where(~df["Contratuais limitados ao êxito"], exito)
     df["Receita do escritório"] = df[["Sucumbência (execução)", "Contratuais (execução)"]].sum(axis=1, min_count=1)
     # repasse: vale o LIQUIDO CLIENTE da planilha; o cálculo só entra quando a célula está vazia
