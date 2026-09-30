@@ -378,27 +378,40 @@ def _tipo_peca(s):
     return "Outros"
 
 
-EXEC_DATAS = ["DISTRIB.", "SISBAJUD", "BLOQUEIO", "PED. ALVARÁ", "EXP. ALVARÁ"]
-EXEC_VALORES = ["TOTAL", "HONORARIOS", "REPETIÇÃO", "MULTA 10%", "HON. 10%", "ALVARA"]
+EXEC_DATAS = ["DISTRIB.", "SISBAJUD", "BLOQUEIO", "PED. ALVARÁ", "RECEBIMENTO"]
+EXEC_VALORES = ["TOTAL", "HONORARIOS", "REPETIÇÃO", "MULTA 10%", "HON. 10%", "CONTRATUAIS PARC.", "CONTRATUAIS %"]
 
 
 def prep_execucao(values) -> pd.DataFrame:
+    """Aba Execução: DISTRIB. | SISBAJUD | BLOQUEIO | PED. ALVARÁ | RECEBIMENTO | Tipo | CLIENTE | ORIGINARIO |
+    CUMPRIMENTO | TRIBUNAL | TOTAL | HONORARIOS | REPETIÇÃO | MULTA 10% | HON. 10% | CONTRATUAIS PARC. | CONTRATUAIS %
+
+    TOTAL (acordo ou depósito) = HONORARIOS + REPETIÇÃO + MULTA 10% + HON. 10% (art. 523 do CPC).
+    CONTRATUAIS % = percentual do caso sobre a parte do cliente (REPETIÇÃO + MULTA 10%), em R$.
+    CONTRATUAIS PARC. = parcela fixa dos contratuais, puxada por fórmula do Registro, em R$.
+    """
     df = build_frame(values, TABS["execucao"])
     df = df[df["CLIENTE"].notna()].copy()
+    # planilhas antigas: EXP. ALVARÁ virou RECEBIMENTO
+    nomes = {_norm(c): c for c in df.columns}
+    if _norm("RECEBIMENTO") not in nomes and _norm("EXP. ALVARÁ") in nomes:
+        df = df.rename(columns={nomes[_norm("EXP. ALVARÁ")]: "RECEBIMENTO"})
     df = _padroniza(df, EXEC_DATAS + EXEC_VALORES + ["Tipo", "CLIENTE", "ORIGINARIO", "CUMPRIMENTO", "TRIBUNAL"])
     for c in EXEC_DATAS:
         df[c] = parse_date(df[c])
     for c in EXEC_VALORES:
         df[c] = parse_money(df[c])
+    df["CLIENTE"] = df["CLIENTE"].astype("string").str.strip()
     # coluna F da planilha: cumprimento de sentença ou acordo
-    df["Tipo"] = df["Tipo"].astype("string").str.strip().str.capitalize().fillna("Não informado")
+    df["Tipo"] = (df["Tipo"].astype("string").str.strip().str.capitalize()
+                  .replace("", pd.NA).fillna("Não informado"))
     df["cnj_orig"] = cnj_digits(df["ORIGINARIO"])
     df["cnj_cump"] = cnj_digits(df["CUMPRIMENTO"])
     df["Cliente (base)"] = cliente_base(df["CLIENTE"])
     pares = list(zip(EXEC_DATAS[:-1], EXEC_DATAS[1:]))
     for a, b in pares:
         df[f"{a} → {b}"] = (df[b] - df[a]).dt.days
-    df["Distrib. → Alvará expedido"] = (df["EXP. ALVARÁ"] - df["DISTRIB."]).dt.days
+    df["DISTRIB. → RECEBIMENTO"] = (df["RECEBIMENTO"] - df["DISTRIB."]).dt.days
     df["Etapa atual"] = df[EXEC_DATAS].apply(
         lambda r: next((c for c in reversed(EXEC_DATAS) if pd.notna(r[c])), "Não distribuído"), axis=1)
 
@@ -407,36 +420,44 @@ def prep_execucao(values) -> pd.DataFrame:
     df["Soma das parcelas"] = partes.sum(axis=1, min_count=1)
     df["Êxito do cliente"] = df[["REPETIÇÃO", "MULTA 10%"]].sum(axis=1, min_count=1)
     df["Sucumbência (execução)"] = df[["HONORARIOS", "HON. 10%"]].sum(axis=1, min_count=1)
-    df["Alvará expedido"] = df["EXP. ALVARÁ"].notna()
+    df["Recebido"] = df["RECEBIMENTO"].notna()
+    df["Valor recebido"] = df["TOTAL"].where(df["Recebido"])
     return df
 
 
 def financeiro_execucao(exe: pd.DataFrame, reg_all: pd.DataFrame | None) -> pd.DataFrame:
-    """Receita do escritório e repasse ao cliente em cada cumprimento, com os termos do Registro.
+    """Receita do escritório e repasse ao cliente em cada execução (cumprimento ou acordo).
 
-    Cada cumprimento é ligado ao processo originário pelo número CNJ. De lá vêm:
-      % contratual = Contratuais / Valor da causa daquela ação;
-      parcela fixa = Honorários Parc. daquela ação (célula vazia = R$ 0).
-    Contratuais na execução = % contratual × êxito do cliente + parcela fixa, limitado ao êxito.
+    Contratuais = CONTRATUAIS % + CONTRATUAIS PARC., os dois lidos da própria aba Execução.
+    Só quando a célula está vazia o painel recorre ao Registro (processo originário, pelo número CNJ):
+      CONTRATUAIS % vazio  -> % contratual do Registro (Contratuais / Valor da causa) x êxito do cliente;
+      CONTRATUAIS PARC. vazio -> Honorários Parc. do Registro.
+    Os contratuais saem da parte do cliente, então ficam limitados ao êxito dele.
     Êxito do cliente = REPETIÇÃO + MULTA 10%. Sucumbência = HONORARIOS + HON. 10%.
-    Sem vínculo com o Registro, os contratuais ficam em branco: nada é presumido.
     """
     df = exe.copy()
-    df["% contratual"] = pd.NA
-    df["Parcela fixa"] = pd.NA
+    pct_reg = pd.Series(float("nan"), index=df.index)
+    parc_reg = pd.Series(float("nan"), index=df.index)
     df["Vínculo com o Registro"] = False
     if reg_all is not None and len(reg_all):
         base = reg_all.dropna(subset=["cnj"]).drop_duplicates("cnj").set_index("cnj")
         ok = df["cnj_orig"].isin(base.index)
-        df.loc[ok, "% contratual"] = df.loc[ok, "cnj_orig"].map(base["% contratual"])
-        df.loc[ok, "Parcela fixa"] = df.loc[ok, "cnj_orig"].map(base["Honorários Parc."]).fillna(0)
         df["Vínculo com o Registro"] = ok
-    df["% contratual"] = pd.to_numeric(df["% contratual"], errors="coerce")
-    df["Parcela fixa"] = pd.to_numeric(df["Parcela fixa"], errors="coerce")
+        pct_reg[ok] = pd.to_numeric(df.loc[ok, "cnj_orig"].map(base["% contratual"]), errors="coerce")
+        parc_reg[ok] = pd.to_numeric(df.loc[ok, "cnj_orig"].map(base["Honorários Parc."]), errors="coerce").fillna(0)
+
     exito = df["Êxito do cliente"]
-    bruto = (exito * df["% contratual"] + df["Parcela fixa"]).where(exito > 0)
-    # o desconto sai da parte do cliente no alvará: não pode passar do êxito dele
-    df["Contratuais limitados ao êxito"] = (bruto > exito).fillna(False)
+    variavel = df["CONTRATUAIS %"].fillna(exito * pct_reg)
+    df["Parcela fixa"] = df["CONTRATUAIS PARC."].fillna(parc_reg)
+    origem = pd.Series("Sem dado", index=df.index)
+    origem[pct_reg.notna()] = "Registro"
+    origem[df["CONTRATUAIS %"].notna()] = "Planilha"
+    df["Origem dos contratuais"] = origem
+    df["Contratuais % (R$)"] = variavel
+    df["% contratual"] = (variavel / exito).where(exito > 0)
+
+    bruto = (variavel + df["Parcela fixa"].fillna(0)).where((exito > 0) & variavel.notna())
+    df["Contratuais limitados ao êxito"] = (bruto > exito).fillna(False).astype(bool)
     df["Contratuais (execução)"] = bruto.where(~df["Contratuais limitados ao êxito"], exito)
     df["Receita do escritório"] = df[["Sucumbência (execução)", "Contratuais (execução)"]].sum(axis=1, min_count=1)
     df["Repasse ao cliente"] = exito - df["Contratuais (execução)"].fillna(0)
@@ -444,17 +465,17 @@ def financeiro_execucao(exe: pd.DataFrame, reg_all: pd.DataFrame | None) -> pd.D
 
 
 FASES_FIN = ["Não distribuído", "Aguardando sentença", "Sentença favorável", "Em execução",
-             "Alvará expedido", "Improcedente / extinto"]
+             "Recebido", "Improcedente / extinto"]
 
 
 def fase_financeira(reg: pd.DataFrame, exe: pd.DataFrame) -> pd.Series:
     """Em que ponto do caminho até o dinheiro cada processo está."""
     em_exec = set(exe.loc[exe["DISTRIB."].notna(), "cnj_orig"].dropna())
-    alvara = set(exe.loc[exe["EXP. ALVARÁ"].notna(), "cnj_orig"].dropna())
+    recebido = set(exe.loc[exe["RECEBIMENTO"].notna(), "cnj_orig"].dropna())
 
     def uma(r):
-        if r["cnj"] in alvara:
-            return "Alvará expedido"
+        if r["cnj"] in recebido:
+            return "Recebido"
         if r["cnj"] in em_exec:
             return "Em execução"
         if r["Resultado"] in ("Improcedente", "Extinção sem mérito"):
@@ -494,6 +515,21 @@ def quality_report(reg, prz, exe) -> list[str]:
             avisos.append(f"Execução: em {len(dif)} cumprimento(s) o TOTAL não bate com HONORARIOS + REPETIÇÃO + "
                           f"MULTA 10% + HON. 10% ({', '.join(dif['CLIENTE'].astype(str).head(4))}). "
                           "Os valores de receita dessas linhas saem das parcelas, não do TOTAL.")
+    exe_ok = exe[exe["TOTAL"].notna()]
+    sem_tipo = exe_ok["Tipo"].eq("Não informado")
+    if sem_tipo.any():
+        avisos.append(f"Execução: {sem_tipo.sum()} linha(s) sem Tipo (Cumprimento ou Acordo): "
+                      + ", ".join(exe_ok.loc[sem_tipo, "CLIENTE"].astype(str).head(4)) + ".")
+    fora = ~exe["Tipo"].isin(["Cumprimento", "Acordo", "Não informado"])
+    if fora.any():
+        avisos.append("Execução: Tipo fora do padrão (use Cumprimento ou Acordo): "
+                      + ", ".join(sorted(exe.loc[fora, "Tipo"].astype(str).unique())) + ".")
+    for col in ("CONTRATUAIS %", "CONTRATUAIS PARC."):
+        vazio = exe_ok[col].isna()
+        if vazio.any():
+            avisos.append(f"Execução: {vazio.sum()} linha(s) com TOTAL e sem {col} "
+                          f"({', '.join(exe_ok.loc[vazio, 'CLIENTE'].astype(str).head(4))}). "
+                          "O painel usa o valor do processo no Registro, se houver vínculo pelo número CNJ.")
     if reg.attrs.get("tem_parc"):
         # contagem dobrada: Contratuais (H) ainda com a parcela fixa embutida depois de criada a coluna I
         c = reg.dropna(subset=["Contratuais", "Valor da causa", "Honorários Parc."])

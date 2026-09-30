@@ -42,7 +42,7 @@ PAINEL = [
     st.Page(dash.financeiro, title="Financeiro", icon=":material/account_balance_wallet:"),
     st.Page(dash.processos, title="Processos e sentenças", icon=":material/gavel:"),
     st.Page(dash.prazos, title="Prazos", icon=":material/event_available:"),
-    st.Page(dash.execucao, title="Execução e alvarás", icon=":material/payments:"),
+    st.Page(dash.execucao, title="Execução e recebimentos", icon=":material/payments:"),
     st.Page(dash.clientes, title="Clientes", icon=":material/groups:"),
     st.Page(dash.ficha, title="Ficha do processo", icon=":material/description:"),
     st.Page(dash.qualidade, title="Qualidade dos dados", icon=":material/rule:"),
