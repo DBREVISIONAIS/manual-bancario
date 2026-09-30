@@ -3,7 +3,7 @@ import plotly.express as px
 import plotly.io as pio
 import streamlit as st
 
-from data import EXEC_DATAS, FASES_FIN, fase_financeira, financeiro_execucao
+from data import EXEC_DATAS, FASES_FIN, banco_base, fase_financeira, financeiro_execucao
 
 RITOS_JUD = ["Procedimento comum", "Juizado Especial (JEC)"]
 
@@ -497,12 +497,31 @@ def prazos():
                                     "FATAL": st.column_config.DateColumn(format="DD/MM/YYYY")})
 
 
+def _previsao_recebimento(ex, hoje):
+    """Data estimada de recebimento das execuções ainda não recebidas.
+
+    Premissa: DISTRIB. + mediana de dias DISTRIB. → RECEBIMENTO das execuções já recebidas,
+    do mesmo Tipo quando houver pelo menos uma; senão, de todas. Retorna (série de datas, base usada).
+    """
+    feitos = ex.dropna(subset=["DISTRIB. → RECEBIMENTO"])
+    geral = feitos["DISTRIB. → RECEBIMENTO"].median()
+    por_tipo = feitos.groupby("Tipo")["DISTRIB. → RECEBIMENTO"].median()
+    base = {"geral": (geral, len(feitos)),
+            **{t: (v, int((feitos["Tipo"] == t).sum())) for t, v in por_tipo.items()}}
+    if pd.isna(geral):
+        return pd.Series(pd.NaT, index=ex.index), base
+    dias = ex["Tipo"].map(por_tipo).fillna(geral)
+    prev = ex["DISTRIB."] + pd.to_timedelta(dias, unit="D")
+    return prev.where(ex["RECEBIMENTO"].isna()), base
+
+
 def execucao():
     _, _, exe = _dados()
     st.title("Execução e recebimentos")
     if exe.empty:
         st.info("A aba Execução ainda não tem lançamentos.")
         return
+    hoje = pd.Timestamp(st.session_state.get("hoje", pd.Timestamp.today())).normalize()
 
     tipos = [t for t in ["Cumprimento", "Acordo", "Não informado"] if t in set(exe["Tipo"])]
     tipos += [t for t in sorted(set(exe["Tipo"])) if t not in tipos]
@@ -510,40 +529,165 @@ def execucao():
         sel = st.segmented_control("Tipo de execução", ["Todos"] + tipos, default="Todos", key="tipo_exec")
         if sel not in (None, "Todos"):
             exe = exe[exe["Tipo"] == sel]
+    if exe.empty:
+        st.info("Nenhuma execução desse tipo.")
+        return
 
+    ex = financeiro_execucao(exe, st.session_state.get("reg_all"))
+    ex["Banco"] = banco_base(ex["CLIENTE"].astype(str).str.split(r"\s+x\s+", n=1, regex=True).str[-1])
+    ex["Situação"] = ex["Recebido"].map({True: "Recebido", False: "A receber"})
+    ex["Previsão de recebimento"], base_prev = _previsao_recebimento(ex, hoje)
+    rec, pend = ex[ex["Recebido"]], ex[~ex["Recebido"]]
+
+    # ---------------------------------------------------------------- resumo
+    st.subheader("Resumo financeiro")
     c = st.columns(4)
-    c[0].metric("Execuções", num(len(exe)), f"{num(exe['DISTRIB.'].notna().sum())} distribuídas", delta_color="off")
-    c[1].metric("Total executado", brl(exe["TOTAL"].sum()))
-    c[2].metric("Honorários", brl(exe["HONORARIOS"].sum()))
-    c[3].metric("Recebidos", num(exe["RECEBIMENTO"].notna().sum()),
-                brl(exe.loc[exe["RECEBIMENTO"].notna(), "TOTAL"].sum()), delta_color="off")
+    c[0].metric("Execuções", num(len(ex)), f"{num(ex['DISTRIB.'].notna().sum())} distribuídas", delta_color="off")
+    c[1].metric("Total executado", brl(ex["TOTAL"].sum()), f"média {brl(ex['TOTAL'].mean())} por execução",
+                delta_color="off")
+    c[2].metric("Receita do escritório", brl(ex["Receita do escritório"].sum()),
+                f"sucumbência {brl(ex['Sucumbência (execução)'].sum())} + contratuais "
+                f"{brl(ex['Contratuais (execução)'].sum())}", delta_color="off")
+    c[3].metric("Repasse aos clientes", brl(ex["Repasse ao cliente"].sum()),
+                f"sobre êxito de {brl(ex['Êxito do cliente'].sum())}", delta_color="off")
+    c = st.columns(4)
+    c[0].metric("Já recebido", brl(rec["TOTAL"].sum()), f"{num(len(rec))} execuções", delta_color="off")
+    c[1].metric("Receita já recebida", brl(rec["Receita do escritório"].sum()))
+    c[2].metric("A receber", brl(pend["TOTAL"].sum()), f"{num(len(pend))} execuções", delta_color="off")
+    c[3].metric("Receita a receber", brl(pend["Receita do escritório"].sum()),
+                f"sucumbência {brl(pend['Sucumbência (execução)'].sum())} + contratuais "
+                f"{brl(pend['Contratuais (execução)'].sum())}", delta_color="off")
 
-    if len(tipos) > 1:
-        t = exe.groupby("Tipo").agg(Execuções=("CLIENTE", "size"), Total=("TOTAL", "sum"),
-                                    Recebido=("Valor recebido", "sum")).reset_index()
-        st.dataframe(t, hide_index=True, width="stretch",
-                     column_config={"Total": MOEDA("Total executado"), "Recebido": MOEDA("Já recebido")})
+    # ---------------------------------------------------------------- composição
+    comp_cols = {"HONORARIOS": "Sucumbência fixada", "HON. 10%": "Honorários 10% (art. 523)",
+                 "Contratuais % (R$)": "Contratuais (%)", "Parcela fixa": "Contratuais (parcela fixa)",
+                 "Repasse ao cliente": "Repasse ao cliente"}
+    cores = ["#00315F", "#2F7CC1", "#C9A227", "#E3C86B", "#3E8E7E"]
+    comp = ex.copy()
+    # quando os contratuais foram limitados ao êxito, a parcela fixa efetiva é o que sobrou
+    comp["Parcela fixa"] = (comp["Contratuais (execução)"] - comp["Contratuais % (R$)"]).clip(lower=0)
+    comp["Contratuais % (R$)"] = comp[["Contratuais % (R$)", "Contratuais (execução)"]].min(axis=1)
+    esq, dir_ = st.columns(2)
+    with esq:
+        tot = comp[list(comp_cols)].sum().rename(comp_cols).reset_index()
+        tot.columns = ["Destino", "R$"]
+        tot = tot[tot["R$"] > 0]
+        fig = px.pie(tot, names="Destino", values="R$", hole=0.55, title="Para onde vai o valor executado",
+                     color_discrete_sequence=cores)
+        fig.update_traces(textinfo="percent", sort=False)
+        _chart(fig)
+    with dir_:
+        g = comp.groupby("Tipo")[list(comp_cols)].sum().rename(columns=comp_cols).reset_index()
+        g = g.melt(id_vars="Tipo", var_name="Destino", value_name="R$")
+        _chart(px.bar(g, x="Tipo", y="R$", color="Destino", title="Composição por tipo",
+                      color_discrete_sequence=cores, labels={"Tipo": ""}))
+    st.caption("A composição parte das colunas HONORARIOS, REPETIÇÃO, MULTA 10%, HON. 10%, CONTRATUAIS % e "
+               "CONTRATUAIS PARC. Onde o TOTAL não bate com a soma das parcelas (ver Qualidade dos dados), "
+               "o gráfico segue as parcelas.")
+
+    # ---------------------------------------------------------------- projeção
+    st.subheader("Projeção de recebimentos")
+    n_base = base_prev["geral"][1]
+    if pd.isna(base_prev["geral"][0]):
+        st.info("Ainda não há execução com DISTRIB. e RECEBIMENTO preenchidos; sem esse histórico não dá para "
+                "estimar quando os valores pendentes entram. A tabela abaixo mostra o que está a receber por etapa.")
+    else:
+        detalhe = "; ".join(f"{t}: {num(v, 0)} dias ({n} caso{'s' if n != 1 else ''})"
+                            for t, (v, n) in base_prev.items() if t != "geral")
+        st.caption(f"Previsão = DISTRIB. + mediana de dias até o RECEBIMENTO nas execuções já recebidas ({detalhe}). "
+                   "Quando o tipo ainda não tem histórico, usa a mediana geral.")
+        if n_base < 5:
+            st.warning(f"A previsão se apoia em só {n_base} recebimento(s). Use como ordem de grandeza, não como data.")
+        proj = ex[~ex["Recebido"]].copy()
+        proj["Mês"] = proj["Previsão de recebimento"].dt.to_period("M").dt.to_timestamp()
+        vencida = proj["Previsão de recebimento"] < hoje
+        proj.loc[vencida, "Mês"] = hoje.to_period("M").to_timestamp()
+        proj["Situação"] = vencida.map({True: "Previsão já passou", False: "Previsto"})
+        real = rec.assign(Mês=rec["RECEBIMENTO"].dt.to_period("M").dt.to_timestamp(), Situação="Recebido")
+        linha = pd.concat([real, proj.dropna(subset=["Mês"])])
+        g = linha.groupby(["Mês", "Situação"])["Receita do escritório"].sum().reset_index()
+        fig = px.bar(g, x="Mês", y="Receita do escritório", color="Situação",
+                     title="Receita do escritório: recebida e prevista, por mês",
+                     color_discrete_map={"Recebido": "#3E8E7E", "Previsto": "#2F7CC1",
+                                         "Previsão já passou": "#B55A4A"})
+        fig.update_xaxes(dtick="M1", tickformat="%m/%Y")
+        _chart(fig)
+        c = st.columns(4)
+        fim_mes = hoje + pd.offsets.MonthEnd(0)
+        for i, (rot, lim) in enumerate([("Até o fim do mês", fim_mes), ("Próximos 90 dias", hoje + pd.Timedelta(days=90)),
+                                        ("Próximos 180 dias", hoje + pd.Timedelta(days=180))]):
+            m = proj["Previsão de recebimento"] <= lim
+            c[i].metric(rot, brl(proj.loc[m, "Receita do escritório"].sum()),
+                        f"{num(m.sum())} execuções", delta_color="off")
+        c[3].metric("Previsão já passou", brl(proj.loc[vencida, "Receita do escritório"].sum()),
+                    f"{num(vencida.sum())} execuções: cobrar andamento", delta_color="off")
+        sem_data = proj["Previsão de recebimento"].isna()
+        if sem_data.any():
+            st.caption(f"{sem_data.sum()} execução(ões) sem DISTRIB. ficam fora da projeção: "
+                       + ", ".join(proj.loc[sem_data, "CLIENTE"].astype(str).head(5)))
 
     esq, dir_ = st.columns(2)
     with esq:
-        funil = pd.DataFrame({"Etapa": EXEC_DATAS, "Processos": [exe[e].notna().sum() for e in EXEC_DATAS]})
-        _chart(px.funnel(funil, x="Processos", y="Etapa", title="Até onde cada cumprimento chegou"))
+        g = ex.groupby(["Etapa atual", "Situação"])["Receita do escritório"].sum().reset_index()
+        ordem = ["Não distribuído"] + EXEC_DATAS
+        _chart(px.bar(g, x="Etapa atual", y="Receita do escritório", color="Situação",
+                      category_orders={"Etapa atual": ordem}, title="Receita do escritório por etapa",
+                      color_discrete_map={"Recebido": "#3E8E7E", "A receber": "#C9A227"},
+                      labels={"Etapa atual": ""}))
     with dir_:
-        cols = [c for c in exe.columns if "→" in c]
-        t = exe[cols].agg(["count", "mean", "median"]).T.reset_index()
+        g = (ex.groupby("Banco").agg(Receita=("Receita do escritório", "sum"), Total=("TOTAL", "sum"))
+             .nlargest(10, "Total").sort_values("Total").reset_index())
+        _chart(px.bar(g.melt(id_vars="Banco", var_name="Valor", value_name="R$"), x="R$", y="Banco",
+                      color="Valor", barmode="group", orientation="h", title="Por banco (10 maiores)",
+                      color_discrete_sequence=["#00315F", "#C9A227"], labels={"Banco": ""}))
+
+    esq, dir_ = st.columns(2)
+    with esq:
+        g = ex.groupby(["TRIBUNAL", "Situação"])["TOTAL"].sum().reset_index()
+        _chart(px.bar(g, x="TRIBUNAL", y="TOTAL", color="Situação", title="Total executado por tribunal",
+                      color_discrete_map={"Recebido": "#3E8E7E", "A receber": "#C9A227"},
+                      labels={"TRIBUNAL": "", "TOTAL": "R$"}))
+    with dir_:
+        g = (ex.dropna(subset=["DISTRIB."])
+             .assign(Mês=lambda d: d["DISTRIB."].dt.to_period("M").dt.to_timestamp())
+             .groupby(["Mês", "Tipo"])["TOTAL"].sum().reset_index())
+        fig = px.bar(g, x="Mês", y="TOTAL", color="Tipo", title="Total executado pela data de distribuição",
+                     color_discrete_map=COR_TIPO, labels={"TOTAL": "R$"})
+        fig.update_xaxes(dtick="M1", tickformat="%m/%Y")
+        _chart(fig)
+
+    # ---------------------------------------------------------------- andamento
+    st.subheader("Andamento")
+    esq, dir_ = st.columns(2)
+    with esq:
+        funil = pd.DataFrame({"Etapa": EXEC_DATAS, "Processos": [ex[e].notna().sum() for e in EXEC_DATAS]})
+        _chart(px.funnel(funil, x="Processos", y="Etapa", title="Até onde cada execução chegou"))
+    with dir_:
+        cols = [c for c in ex.columns if "→" in c]
+        t = ex[cols].agg(["count", "mean", "median"]).T.reset_index()
         t.columns = ["Intervalo", "Processos", "Média (dias)", "Mediana (dias)"]
         st.markdown("**Tempo entre etapas**")
         st.dataframe(t, hide_index=True, width="stretch",
                      column_config={"Média (dias)": st.column_config.NumberColumn(format="%.0f"),
                                     "Mediana (dias)": st.column_config.NumberColumn(format="%.0f")})
 
-    vis = ["CLIENTE", "Tipo", "ORIGINARIO", "CUMPRIMENTO", "TRIBUNAL", "Etapa atual"] + EXEC_DATAS + \
-          ["TOTAL", "HONORARIOS", "REPETIÇÃO", "MULTA 10%", "HON. 10%", "CONTRATUAIS PARC.", "CONTRATUAIS %"]
-    cfg = {c: st.column_config.DateColumn(format="DD/MM/YYYY") for c in EXEC_DATAS}
-    cfg.update({c: st.column_config.NumberColumn(format="R$ %.2f")
-                for c in ["TOTAL", "HONORARIOS", "REPETIÇÃO", "MULTA 10%", "HON. 10%", "CONTRATUAIS PARC.",
-                          "CONTRATUAIS %"]})
-    st.dataframe(exe[vis], hide_index=True, width="stretch", column_config=cfg)
+    lim = ex[ex["Contratuais limitados ao êxito"]]
+    if len(lim):
+        st.warning(f"Em {len(lim)} execução(ões) CONTRATUAIS % + CONTRATUAIS PARC. passaria do êxito do cliente; "
+                   "o painel limitou os contratuais ao êxito (repasse zero): " + ", ".join(lim["CLIENTE"].astype(str)))
+
+    # ---------------------------------------------------------------- tabela
+    st.subheader("Execuções")
+    vis = (["CLIENTE", "Tipo", "TRIBUNAL", "Etapa atual", "Situação", "Previsão de recebimento"] + EXEC_DATAS +
+           ["TOTAL", "HONORARIOS", "REPETIÇÃO", "MULTA 10%", "HON. 10%", "CONTRATUAIS PARC.", "CONTRATUAIS %",
+            "Contratuais (execução)", "Receita do escritório", "Repasse ao cliente", "ORIGINARIO", "CUMPRIMENTO"])
+    moeda = ["TOTAL", "HONORARIOS", "REPETIÇÃO", "MULTA 10%", "HON. 10%", "CONTRATUAIS PARC.", "CONTRATUAIS %",
+             "Contratuais (execução)", "Receita do escritório", "Repasse ao cliente"]
+    cfg = {c: st.column_config.DateColumn(format="DD/MM/YYYY") for c in EXEC_DATAS + ["Previsão de recebimento"]}
+    cfg.update({c: MOEDA() for c in moeda})
+    cfg["Contratuais (execução)"] = MOEDA("Contratuais (total)")
+    st.dataframe(ex[vis].sort_values(["Situação", "Previsão de recebimento"]), hide_index=True, width="stretch",
+                 column_config=cfg)
 
 
 def clientes():
